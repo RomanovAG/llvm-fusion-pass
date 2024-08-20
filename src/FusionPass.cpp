@@ -64,32 +64,42 @@ void
 fuse(Loop *L1, Loop *L2)
 {
 	BasicBlock *Header1 = L1->getHeader(); /* Will be Header */
-	BasicBlock *Header2 = L2->getHeader();
+	BasicBlock *Header2 = L2->getHeader(); /* Will be deleted */
 	BasicBlock *Latch1 = L1->getLoopLatch();
 	BasicBlock *Latch2 = L2->getLoopLatch(); /* Will be Latch */
-
-	BasicBlock *PreHeader2 = L2->getLoopPreheader();
+	BasicBlock *PreHeader1 = L1->getLoopPreheader();
+	BasicBlock *PreHeader2 = L2->getLoopPreheader(); /* Will be deleted */
 	
-	/*Instruction *Latch1Term = Latch1->getTerminator();
+	BasicBlock *BodyEntry2 = Header2->getTerminator()->getSuccessor(0);
+	BasicBlock *Exit2 = Header2->getTerminator()->getSuccessor(1);
+
+	Instruction *Latch1Term = Latch1->getTerminator();
 	if (Latch1Term->getOpcode() != Instruction::Br) throw std::exception();
-	Latch1Term->replaceSuccessorWith(Header1, Header2);
+	Latch1Term->replaceSuccessorWith(Header1, BodyEntry2);
 
 	Instruction *Latch2Term = Latch2->getTerminator();
 	if (Latch2Term->getOpcode() != Instruction::Br) throw std::exception();
-	Latch2Term->replaceSuccessorWith(Header2, Header1);*/
-	
+	Latch2Term->replaceSuccessorWith(Header2, Header1);
+
 	Instruction *Header1Term = Header1->getTerminator();
-	Header1Term->replaceSuccessorWith(PreHeader2, Header2);
+	Header1Term->replaceSuccessorWith(PreHeader2, Exit2);
 
-//	Header1->replacePhiUsesWith(Latch1, Latch2);
-	//outs() << "huh\n";
+	/* Update phis' predecessors */
+	Header1->replacePhiUsesWith(Latch1, Latch2);
+	Header2->replacePhiUsesWith(PreHeader2, PreHeader1);
 
-//	Phi->replaceIncomingBlockWith(Latch2, Latch1);
-	outs() << "huh1\n";
-	Header2->replacePhiUsesWith(PreHeader2, Header1);
+	/* Move phis to Header1 */
+	Instruction *FirstNonPhi1 = Header1->getFirstNonPHI();
+	while (Header2->begin()->getOpcode() == Instruction::PHI)
+	{
+		Instruction *Phi = &*(Header2->begin());
+		Phi->removeFromParent();
+		Phi->insertBefore(FirstNonPhi1);
+	}
+	
+	/* Cleanup */
 	PreHeader2->eraseFromParent();
-	outs() << "huh2\n";
-
+	Header2->eraseFromParent();
 }
 
 bool

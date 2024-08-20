@@ -1,6 +1,7 @@
-#include "llvm/IR/Dominators.h"
-#include "llvm/Analysis/PostDominators.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Analysis/PostDominators.h"
+#include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
 #include "llvm/Support/raw_ostream.h"
@@ -27,57 +28,76 @@ blockContainsVolatileInst(const BasicBlock &BB)
 bool
 loopContainsVolatileInst(const Loop &L)
 {
-	for (BasicBlock *BB : L.blocks())
+	for (const BasicBlock *BB : L.blocks())
 	{
-		//outs() << BB->getNumber() << "(" << BB->size() << ")_";
 		if (blockContainsVolatileInst(*BB))
 		{
 			return true;
 		}
 	}
-	//outs() << "size: " << L.getNumBlocks() << "\n";
 	return false;
 }
 
 bool
-loopDominates(Loop *L1, Loop *L2, DominatorTree &DT)
+loopDominates(const Loop *L1, const Loop *L2, const DominatorTree &DT)
 {
-	//SmallVector<BasicBlock *> L1ExitBBs, L2ExitBBs;
-	//L1->getExitingBlocks(L1ExitBBs);
-	//L2->getExitingBlocks(L2ExitBBs);
-	//outs() << L1ExitBBs.size() << " " << L2ExitBBs.size() << "\n";
-	const auto H1 = L1->getLoopPreheader();
-	const auto H2 = L2->getLoopPreheader();
+	const BasicBlock *H1 = L1->getLoopPreheader();
+	const BasicBlock *H2 = L2->getLoopPreheader();
 	return DT.properlyDominates(H1, H2);
-	/*for (BasicBlock *BB1 : L1ExitBBs)
-	{
-		for (BasicBlock *BB2 : L2ExitBBs)
-		{
-			if (DT.properlyDominates(BB1, BB2) == false)
-			{
-				outs() << "NO\n";
-				return false;
-			}
-		}
-	}
-	return true;*/
 }
 
 bool
-loopPostDominates(Loop *L1, Loop *L2, PostDominatorTree &PDT)
+loopPostDominates(const Loop *L1, const Loop *L2, const PostDominatorTree &PDT)
 {
-	const auto H1 = L1->getLoopPreheader();
-	const auto H2 = L2->getLoopPreheader();
+	const BasicBlock *H1 = L1->getLoopPreheader();
+	const BasicBlock *H2 = L2->getLoopPreheader();
 	return PDT.properlyDominates(H1, H2);
+}
+
+bool
+isControlFlowEqLoops(const Loop *L1, const Loop *L2, const DominatorTree &DT, const PostDominatorTree &PDT)
+{
+	return (loopDominates(L1, L2, DT) && loopPostDominates(L2, L1, PDT));
+}
+
+void
+fuse(Loop *L1, Loop *L2)
+{
+	BasicBlock *Header1 = L1->getHeader(); /* Will be Header */
+	BasicBlock *Header2 = L2->getHeader();
+	BasicBlock *Latch1 = L1->getLoopLatch();
+	BasicBlock *Latch2 = L2->getLoopLatch(); /* Will be Latch */
+
+	BasicBlock *PreHeader2 = L2->getLoopPreheader();
+	
+	/*Instruction *Latch1Term = Latch1->getTerminator();
+	if (Latch1Term->getOpcode() != Instruction::Br) throw std::exception();
+	Latch1Term->replaceSuccessorWith(Header1, Header2);
+
+	Instruction *Latch2Term = Latch2->getTerminator();
+	if (Latch2Term->getOpcode() != Instruction::Br) throw std::exception();
+	Latch2Term->replaceSuccessorWith(Header2, Header1);*/
+	
+	Instruction *Header1Term = Header1->getTerminator();
+	Header1Term->replaceSuccessorWith(PreHeader2, Header2);
+
+//	Header1->replacePhiUsesWith(Latch1, Latch2);
+	//outs() << "huh\n";
+
+//	Phi->replaceIncomingBlockWith(Latch2, Latch1);
+	outs() << "huh1\n";
+	Header2->replacePhiUsesWith(PreHeader2, Header1);
+	PreHeader2->eraseFromParent();
+	outs() << "huh2\n";
 
 }
 
 bool
-FuseLoops(Function &F, FunctionAnalysisManager &AM)
+FuseLoops(Function &F, FunctionAnalysisManager &FAM)
 {
 	
 	outs() << "Func: " << F.getName() << "\n";
-	LoopInfo &li = AM.getResult<LoopAnalysis>(F);
+	LoopInfo &li = FAM.getResult<LoopAnalysis>(F);
 	//li.print(outs());
 	const std::vector<Loop *> &TopLoops = li.getTopLevelLoops();
 
@@ -92,15 +112,13 @@ FuseLoops(Function &F, FunctionAnalysisManager &AM)
 		}
 	}
 
-	DominatorTree		DT(F);
-	PostDominatorTree	PDT(F);
+	DominatorTree     &DT  = FAM.getResult<DominatorTreeAnalysis>(F);
+	PostDominatorTree &PDT = FAM.getResult<PostDominatorTreeAnalysis>(F);
 	
 	/* Build Control Flow Equivalent sets */
 	std::vector<std::vector<Loop *>> CFEs;
 	for (auto it = Candidates.begin(), ite = Candidates.end(); it != ite; ++it)
 	{
-		//std::vector A;
-		//A.push_back(*it);
 		CFEs.push_back(std::vector<Loop *> {*it});
 	}
 	for (auto it1 = CFEs.begin(), it1e = CFEs.end(); it1 != it1e; ++it1)
@@ -110,7 +128,7 @@ FuseLoops(Function &F, FunctionAnalysisManager &AM)
 		for (auto it2 = Candidates.begin(), it2e = Candidates.end(); it2 != it2e;)
 		{
 			Loop *L2 = *it2;
-			if (loopDominates(L1, L2, DT) && loopPostDominates(L2, L1, PDT))
+			if (isControlFlowEqLoops(L1, L2, DT, PDT))
 			{
 				outs() << "	yes\n";
 				it1->push_back(L2);
@@ -126,7 +144,7 @@ FuseLoops(Function &F, FunctionAnalysisManager &AM)
 		std::remove_if(
 			CFEs.begin(),
 			CFEs.end(),
-			[](const std::vector<Loop *> v)
+			[](const std::vector<Loop *> &v)
 			{
 				return v.size() == 1;
 			}
@@ -135,12 +153,49 @@ FuseLoops(Function &F, FunctionAnalysisManager &AM)
 	);
 	outs() << CFEs.size() << "__\n";
 
+	bool fused = false;
+	ScalarEvolution &SE = FAM.getResult<ScalarEvolutionAnalysis>(F);
 	for (auto &set : CFEs)
 	{
-		
-	}
+		for (auto it1 = set.begin(), it1e = set.end(); it1 != it1e; ++it1)
+		{
+			Loop *L1 = *it1;
+			for (auto it2 = std::next(it1), it2e = set.end(); it2 != it2e; ++it2)
+			{
+				Loop *L2 = *it2;
+				const auto TripCount1 = SE.getSymbolicMaxBackedgeTakenCount(L1);
+				const auto TripCount2 = SE.getSymbolicMaxBackedgeTakenCount(L2);
+				if (TripCount1->getSCEVType() == SCEVTypes::scCouldNotCompute ||
+					TripCount2->getSCEVType() == SCEVTypes::scCouldNotCompute)
+				{
+					outs() << "cncompute\n";
+					continue;
+				}
+				if (TripCount1 != TripCount2)
+				{
+					//TripCount1->print(outs());
+					//outs() << "\n";
+					continue;
+				}
 
-	bool fused = false;
+				SmallVector<BasicBlock *> Successors;
+				L1->getExitBlocks(Successors);
+				outs() << "size: " << Successors.size() << "\n";
+				for (const BasicBlock *BB : Successors)
+				{
+					if (BB != L2->getLoopPreheader())
+					{
+						outs() << "not adj\n";
+						//continue
+					}
+				}
+
+				fuse(L1, L2);
+				fused = true;
+				return fused;
+			}
+		}
+	}
 
 	return fused;
 }

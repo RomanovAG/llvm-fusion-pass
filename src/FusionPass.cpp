@@ -12,14 +12,84 @@ using namespace llvm;
 
 namespace {
 
-bool
-blockContainsVolatileInst(const BasicBlock &BB)
+/*bool
+instMightThrowException(const Instruction &I)
 {
-	for (const Instruction &I : BB)
+	if (isa<CallInst>(I) || isa<InvokeInst>(I))
 	{
-		if (I.isVolatile())
+		if (Function *CalledFunc = I.getCalledFunction())
 		{
-			return true;
+			if (CalledFunc->isDeclaration())
+			{
+				if (!CalledFunc->hasFnAttribute(Attribute::NoUnwind))
+				{
+					return true;
+				}
+			}
+			else
+			{
+				for (BasicBlock &BB : *CalledFunc)
+				{
+					for (Instruction &I : BB)
+					{
+						if (instMightThrowException(I))
+						{
+							return true;
+						}
+					}
+				}
+			}
+		}
+	}
+	if (isa<LandingPadInst>(I))
+	{
+		return true;
+	}
+	return false;
+}*/
+
+bool
+loopHasMultipleEntriesAndExits(const Loop &L)
+{
+	const BasicBlock *Header = L.getHeader();
+
+	if (Header->getTerminator()->getNumSuccessors() > 2) return true;
+
+	for (const BasicBlock *BB : L.blocks())
+	{
+		if (L.isLoopLatch(BB) || L.isLoopExiting(BB) || BB == Header)
+		{
+			continue;
+		}
+		for (const BasicBlock *Pred : predecessors(BB))
+		{
+			if (L.contains(Pred) == false)
+			{
+				return true;
+			}
+		}
+		for (const BasicBlock *Succ : successors(BB))
+		{
+			if (L.contains(Succ) == false)
+			{
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+bool
+loopMightThrowException(const Loop &L)
+{
+	for (const BasicBlock *BB : L.blocks())
+	{
+		for (const Instruction &I : *BB)
+		{
+			if (I.mayThrow())
+			{
+				return true;
+			}
 		}
 	}
 	return false;
@@ -30,9 +100,12 @@ loopContainsVolatileInst(const Loop &L)
 {
 	for (const BasicBlock *BB : L.blocks())
 	{
-		if (blockContainsVolatileInst(*BB))
+		for (const Instruction &I : *BB)
 		{
-			return true;
+			if (I.isVolatile())
+			{
+				return true;
+			}
 		}
 	}
 	return false;
@@ -98,38 +171,64 @@ fuse(Loop *L1, Loop *L2)
 	}
 	
 	/* Cleanup */
+	Latch1Term->setMetadata("llvm.loop", nullptr);
+
 	PreHeader2->eraseFromParent();
 	Header2->eraseFromParent();
+
+	//assert(!L1->isInvalid() && "wtf have i done");
+}
+
+SmallVector<Loop *>
+collectLoopsAtDepth(const LoopInfo &LI, unsigned Depth)
+{
+	SmallVector<Loop *> LoopsAtDepth;
+	SmallVector<Loop *, 8> Worklist;
+	for (Loop *TopLoop : LI)
+	{
+		Worklist.push_back(TopLoop);
+		while (!Worklist.empty())
+		{
+			Loop *L = Worklist.pop_back_val();
+			if (L->getLoopDepth() == Depth)
+			{
+				LoopsAtDepth.push_back(L);
+			}
+			else
+			{
+				for (Loop *SubLoop : *L)
+				{
+					Worklist.push_back(SubLoop);
+				}
+			}
+		}
+	}
+	return LoopsAtDepth;
 }
 
 bool
-FuseLoops(Function &F, FunctionAnalysisManager &FAM)
+processLoops(SmallVector<Loop *> &Loops, DominatorTree &DT, PostDominatorTree &PDT, DenseMap<const BasicBlock *, const SCEV *> &LoopSCEVInfo)
 {
-	
-	outs() << "Func: " << F.getName() << "\n";
-	LoopInfo &li = FAM.getResult<LoopAnalysis>(F);
-	//li.print(outs());
-	const std::vector<Loop *> &TopLoops = li.getTopLevelLoops();
-
 	/* Collect candidates */
 	std::set<Loop *> Candidates;
-	for (Loop *L : TopLoops)
+	for (Loop *L : Loops)
 	{
-		//outs() << L->isLoopSimplifyForm() << "\n";
-		if (L->isLoopSimplifyForm() && loopContainsVolatileInst(*L) == false)
+		if	(
+			L->isLoopSimplifyForm()
+			&& loopContainsVolatileInst(*L) == false
+			//&& loopMightThrowException(*L) == false /* Somehow always returns true */
+			&& loopHasMultipleEntriesAndExits(*L) == false
+			)
 		{
 			Candidates.insert(L);
 		}
 	}
 
-	DominatorTree     &DT  = FAM.getResult<DominatorTreeAnalysis>(F);
-	PostDominatorTree &PDT = FAM.getResult<PostDominatorTreeAnalysis>(F);
-	
 	/* Build Control Flow Equivalent sets */
 	std::vector<std::vector<Loop *>> CFEs;
-	for (auto it = Candidates.begin(), ite = Candidates.end(); it != ite; ++it)
+	for (Loop *L : Candidates)
 	{
-		CFEs.push_back(std::vector<Loop *> {*it});
+		CFEs.push_back(std::vector<Loop *> {L});
 	}
 	for (auto it1 = CFEs.begin(), it1e = CFEs.end(); it1 != it1e; ++it1)
 	{
@@ -140,7 +239,7 @@ FuseLoops(Function &F, FunctionAnalysisManager &FAM)
 			Loop *L2 = *it2;
 			if (isControlFlowEqLoops(L1, L2, DT, PDT))
 			{
-				outs() << "	yes\n";
+				//outs() << "	yes\n";
 				it1->push_back(L2);
 				it2 = Candidates.erase(it2);
 			}
@@ -161,10 +260,9 @@ FuseLoops(Function &F, FunctionAnalysisManager &FAM)
 		),
 		CFEs.end()
 	);
-	outs() << CFEs.size() << "__\n";
+	//outs() << CFEs.size() << "__\n";
 
 	bool fused = false;
-	ScalarEvolution &SE = FAM.getResult<ScalarEvolutionAnalysis>(F);
 	for (auto &set : CFEs)
 	{
 		for (auto it1 = set.begin(), it1e = set.end(); it1 != it1e; ++it1)
@@ -173,8 +271,8 @@ FuseLoops(Function &F, FunctionAnalysisManager &FAM)
 			for (auto it2 = std::next(it1), it2e = set.end(); it2 != it2e; ++it2)
 			{
 				Loop *L2 = *it2;
-				const auto TripCount1 = SE.getSymbolicMaxBackedgeTakenCount(L1);
-				const auto TripCount2 = SE.getSymbolicMaxBackedgeTakenCount(L2);
+				const auto TripCount1 = LoopSCEVInfo.at(L1->getHeader());
+				const auto TripCount2 = LoopSCEVInfo.at(L2->getHeader());
 				if (TripCount1->getSCEVType() == SCEVTypes::scCouldNotCompute ||
 					TripCount2->getSCEVType() == SCEVTypes::scCouldNotCompute)
 				{
@@ -206,8 +304,53 @@ FuseLoops(Function &F, FunctionAnalysisManager &FAM)
 			}
 		}
 	}
-
 	return fused;
+}
+
+DenseMap<const BasicBlock *, const SCEV *>
+getLoopSCEVInfo(const LoopInfo &LI, ScalarEvolution &SE)
+{
+	DenseMap<const BasicBlock *, const SCEV *> LoopSCEVInfo;
+
+	const SmallVector<Loop *> Loops = LI.getLoopsInPreorder();
+	for (const Loop *L : Loops)
+	{
+		LoopSCEVInfo.insert(std::make_pair(L->getHeader(), SE.getSymbolicMaxBackedgeTakenCount(L)));
+	}
+	return LoopSCEVInfo;
+}
+
+bool
+FuseLoops(Function &F, FunctionAnalysisManager &FAM)
+{
+	bool FusedAny = false;
+	outs() << "Func: " << F.getName() << "\n";
+
+	/* Get analyses */
+	LoopInfo          &LI  = FAM.getResult<LoopAnalysis>(F);
+	DominatorTree     &DT  = FAM.getResult<DominatorTreeAnalysis>(F);
+	PostDominatorTree &PDT = FAM.getResult<PostDominatorTreeAnalysis>(F);
+	ScalarEvolution   &SE  = FAM.getResult<ScalarEvolutionAnalysis>(F);
+
+	/* Store important Scalar Evolution info in map<Header *, SCEV *> */
+	auto LoopSCEVInfo = getLoopSCEVInfo(LI, SE);
+
+	SmallVector<Loop *> LoopsToProcess;
+	for (unsigned i = 1; (LoopsToProcess = collectLoopsAtDepth(LI, i)).empty() == false; i++)
+	{
+		outs() << "loop count before: " << LI.getTopLevelLoops().size() << "\n";
+		FusedAny = processLoops(LoopsToProcess, DT, PDT, LoopSCEVInfo);
+		if (FusedAny)
+		{
+			DT = DominatorTree(F);
+			PDT = PostDominatorTree(F);
+			LI = LoopInfo(DT);
+		}
+		outs()	<< "loop count after: "
+			<< LI.getTopLevelLoops().size() << "\n";
+		break;
+	}
+	return FusedAny;
 }
 
 struct FusionPass : PassInfoMixin<FusionPass> 

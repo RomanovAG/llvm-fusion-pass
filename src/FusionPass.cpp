@@ -57,7 +57,7 @@ loopHasMultipleEntriesAndExits(const Loop &L)
 
 	for (const BasicBlock *BB : L.blocks())
 	{
-		if (L.isLoopLatch(BB) || L.isLoopExiting(BB) || BB == Header)
+		if (L.isLoopExiting(BB) || BB == Header)
 		{
 			continue;
 		}
@@ -138,27 +138,27 @@ fuse(Loop *L1, Loop *L2)
 {
 	BasicBlock *Header1 = L1->getHeader(); /* Will be Header */
 	BasicBlock *Header2 = L2->getHeader(); /* Will be deleted */
-	BasicBlock *Latch1 = L1->getLoopLatch();
-	BasicBlock *Latch2 = L2->getLoopLatch(); /* Will be Latch */
+	BasicBlock *Latch1 = L1->getLoopLatch(); /* Will be Latch */
+	BasicBlock *Latch2 = L2->getLoopLatch();
 	BasicBlock *PreHeader1 = L1->getLoopPreheader();
 	BasicBlock *PreHeader2 = L2->getLoopPreheader(); /* Will be deleted */
 	
 	BasicBlock *BodyEntry2 = Header2->getTerminator()->getSuccessor(0);
 	BasicBlock *Exit2 = Header2->getTerminator()->getSuccessor(1);
 
-	Instruction *Latch1Term = Latch1->getTerminator();
-	if (Latch1Term->getOpcode() != Instruction::Br) throw std::exception();
-	Latch1Term->replaceSuccessorWith(Header1, BodyEntry2);
-
+	while (pred_begin(Latch1) != pred_end(Latch1))
+	{
+		(*(pred_begin(Latch1)))->getTerminator()->replaceSuccessorWith(Latch1, BodyEntry2);
+	}
 	Instruction *Latch2Term = Latch2->getTerminator();
-	if (Latch2Term->getOpcode() != Instruction::Br) throw std::exception();
-	Latch2Term->replaceSuccessorWith(Header2, Header1);
+	Latch2Term->replaceSuccessorWith(Header2, Latch1);
+	Latch1->moveAfter(Latch2);
 
 	Instruction *Header1Term = Header1->getTerminator();
 	Header1Term->replaceSuccessorWith(PreHeader2, Exit2);
 
 	/* Update phis' predecessors */
-	Header1->replacePhiUsesWith(Latch1, Latch2);
+	Header2->replacePhiUsesWith(Latch2, Latch1);
 	Header2->replacePhiUsesWith(PreHeader2, PreHeader1);
 
 	/* Move phis to Header1 */
@@ -171,12 +171,10 @@ fuse(Loop *L1, Loop *L2)
 	}
 	
 	/* Cleanup */
-	Latch1Term->setMetadata("llvm.loop", nullptr);
+	Latch2Term->setMetadata("llvm.loop", nullptr);
 
 	PreHeader2->eraseFromParent();
 	Header2->eraseFromParent();
-
-	//assert(!L1->isInvalid() && "wtf have i done");
 }
 
 SmallVector<Loop *>
@@ -207,7 +205,149 @@ collectLoopsAtDepth(const LoopInfo &LI, unsigned Depth)
 }
 
 bool
-processLoops(SmallVector<Loop *> &Loops, DominatorTree &DT, PostDominatorTree &PDT, DenseMap<const BasicBlock *, const SCEV *> &LoopSCEVInfo)
+tryInsertInCFESet(std::list<Loop *> &set, Loop *L, const DominatorTree &DT, const PostDominatorTree &PDT)
+{
+	if (set.empty())
+	{
+		return false;
+	}
+
+	for (auto it = set.begin(); it != set.end(); ++it)
+	{
+		if (it == set.begin() && isControlFlowEqLoops(L, *it, DT, PDT))
+		{
+			set.insert(it, L);
+			return true;
+		}
+
+		auto nit = std::next(it);
+		if (nit != set.end() 
+			&& isControlFlowEqLoops(*it, L, DT, PDT) && isControlFlowEqLoops(L, *nit, DT, PDT))
+		{
+			set.insert(nit, L);
+			return true;
+		}
+
+		if (nit == set.end() && isControlFlowEqLoops(*it, L, DT, PDT))
+		{
+			set.push_back(L);
+			return true;
+		}
+	}
+	return false;
+}
+
+std::list<std::list<Loop *>>
+buildCFESets(const std::set<Loop *> &Candidates, const DominatorTree &DT, const PostDominatorTree &PDT)
+{
+	std::list<std::list<Loop *>> CFEs;
+
+	for (Loop *L : Candidates)
+	{
+		bool inserted = false;
+		for (auto &set : CFEs)
+		{
+			if (tryInsertInCFESet(set, L, DT, PDT))
+			{
+				inserted = true;
+				break;
+			}
+		}
+
+		if (inserted == false)
+		{
+			CFEs.push_back(std::list<Loop *> {L});
+		}
+	}
+
+	/* Delete sets with only one loop */
+	CFEs.erase(
+		std::remove_if(
+			CFEs.begin(),
+			CFEs.end(),
+			[](const std::list<Loop *> &set)
+			{
+				return set.size() == 1;
+			}
+		),
+		CFEs.end()
+	);
+
+	return CFEs;
+}
+
+bool
+areLoopsAdjacent(const Loop *L1, const Loop *L2)
+{
+	SmallVector<BasicBlock *> Successors;
+	L1->getExitBlocks(Successors);
+	for (const BasicBlock *BB : Successors)
+	{
+		if (BB != L2->getLoopPreheader())
+		{
+			return false;
+		}
+	}
+	return true;
+}
+
+bool
+tryMakeLoopsAdjacent(Loop *L1, Loop *L2)
+{
+	BasicBlock *Exit = L1->getExitBlock();
+	if (Exit == nullptr) return false;
+	if (Exit->getSingleSuccessor() != L2->getLoopPreheader())
+	{
+		outs() << "can not make adj\n";
+		return false;
+	}
+
+	while (pred_begin(Exit) != pred_end(Exit))
+	{
+		(*(pred_begin(Exit)))->getTerminator()->replaceSuccessorWith(Exit, Exit->getSingleSuccessor());
+	}
+	Exit->eraseFromParent();
+	return true;
+}
+
+bool
+processSet(std::list<Loop *> &set, const DenseMap<const BasicBlock *, const SCEV *> &LoopSCEVInfo)
+{
+	for (auto it1 = set.begin(), it1e = set.end(); it1 != it1e; ++it1)
+	{
+		Loop *L1 = *it1;
+		for (auto it2 = std::next(it1), it2e = set.end(); it2 != it2e; ++it2)
+		{
+			Loop *L2 = *it2;
+			const SCEV *TripCount1 = LoopSCEVInfo.at(L1->getHeader());
+			const SCEV *TripCount2 = LoopSCEVInfo.at(L2->getHeader());
+			if (TripCount1->getSCEVType() == SCEVTypes::scCouldNotCompute ||
+				TripCount2->getSCEVType() == SCEVTypes::scCouldNotCompute)
+			{
+				outs() << "cncompute\n";
+				continue;
+			}
+			if (TripCount1 != TripCount2)
+			{
+				continue;
+			}
+			if (areLoopsAdjacent(L1, L2) == false)
+			{
+				if (tryMakeLoopsAdjacent(L1, L2) == false)
+				{
+					continue;
+				}
+			}
+			/* Finally, fuse loops */
+			fuse(L1, L2);
+			return true;
+		}
+	}
+	return false;
+}
+
+bool
+processLoops(const SmallVector<Loop *> &Loops, const DominatorTree &DT, const PostDominatorTree &PDT, const DenseMap<const BasicBlock *, const SCEV *> &LoopSCEVInfo)
 {
 	/* Collect candidates */
 	std::set<Loop *> Candidates;
@@ -225,84 +365,13 @@ processLoops(SmallVector<Loop *> &Loops, DominatorTree &DT, PostDominatorTree &P
 	}
 
 	/* Build Control Flow Equivalent sets */
-	std::vector<std::vector<Loop *>> CFEs;
-	for (Loop *L : Candidates)
-	{
-		CFEs.push_back(std::vector<Loop *> {L});
-	}
-	for (auto it1 = CFEs.begin(), it1e = CFEs.end(); it1 != it1e; ++it1)
-	{
-		Loop *L1 = (*it1)[0];
-		
-		for (auto it2 = Candidates.begin(), it2e = Candidates.end(); it2 != it2e;)
-		{
-			Loop *L2 = *it2;
-			if (isControlFlowEqLoops(L1, L2, DT, PDT))
-			{
-				//outs() << "	yes\n";
-				it1->push_back(L2);
-				it2 = Candidates.erase(it2);
-			}
-			else
-			{
-				++it2;
-			}
-		}
-	}
-	CFEs.erase(
-		std::remove_if(
-			CFEs.begin(),
-			CFEs.end(),
-			[](const std::vector<Loop *> &v)
-			{
-				return v.size() == 1;
-			}
-		),
-		CFEs.end()
-	);
-	//outs() << CFEs.size() << "__\n";
+	std::list<std::list<Loop *>> CFEs = buildCFESets(Candidates, DT, PDT);
 
+	/* Try to fuse any loops from sets */
 	bool fused = false;
 	for (auto &set : CFEs)
 	{
-		for (auto it1 = set.begin(), it1e = set.end(); it1 != it1e; ++it1)
-		{
-			Loop *L1 = *it1;
-			for (auto it2 = std::next(it1), it2e = set.end(); it2 != it2e; ++it2)
-			{
-				Loop *L2 = *it2;
-				const auto TripCount1 = LoopSCEVInfo.at(L1->getHeader());
-				const auto TripCount2 = LoopSCEVInfo.at(L2->getHeader());
-				if (TripCount1->getSCEVType() == SCEVTypes::scCouldNotCompute ||
-					TripCount2->getSCEVType() == SCEVTypes::scCouldNotCompute)
-				{
-					outs() << "cncompute\n";
-					continue;
-				}
-				if (TripCount1 != TripCount2)
-				{
-					//TripCount1->print(outs());
-					//outs() << "\n";
-					continue;
-				}
-
-				SmallVector<BasicBlock *> Successors;
-				L1->getExitBlocks(Successors);
-				outs() << "size: " << Successors.size() << "\n";
-				for (const BasicBlock *BB : Successors)
-				{
-					if (BB != L2->getLoopPreheader())
-					{
-						outs() << "not adj\n";
-						//continue
-					}
-				}
-
-				fuse(L1, L2);
-				fused = true;
-				return fused;
-			}
-		}
+		fused |= processSet(set, LoopSCEVInfo);
 	}
 	return fused;
 }
@@ -334,22 +403,26 @@ FuseLoops(Function &F, FunctionAnalysisManager &FAM)
 
 	/* Store important Scalar Evolution info in map<Header *, SCEV *> */
 	auto LoopSCEVInfo = getLoopSCEVInfo(LI, SE);
-
+	outs() << "\tloop count before: " << LI.getLoopsInPreorder().size() << "\n";
 	SmallVector<Loop *> LoopsToProcess;
-	for (unsigned i = 1; (LoopsToProcess = collectLoopsAtDepth(LI, i)).empty() == false; i++)
+	for (unsigned i = 1; (LoopsToProcess = collectLoopsAtDepth(LI, i)).empty() == false;)
 	{
-		outs() << "loop count before: " << LI.getTopLevelLoops().size() << "\n";
+		
 		FusedAny = processLoops(LoopsToProcess, DT, PDT, LoopSCEVInfo);
 		if (FusedAny)
 		{
-			DT = DominatorTree(F);
+			/* Recalculate analyses since CFG changed */
+			DT  = DominatorTree(F);
 			PDT = PostDominatorTree(F);
-			LI = LoopInfo(DT);
+			LI  = LoopInfo(DT);
 		}
-		outs()	<< "loop count after: "
-			<< LI.getTopLevelLoops().size() << "\n";
-		break;
+		else
+		{
+			i++;
+		}
 	}
+	outs()	<< "\tloop count after: "
+		<< LI.getLoopsInPreorder().size() << "\n";
 	return FusedAny;
 }
 
@@ -397,9 +470,9 @@ CallBackForPassBuilder(PassBuilder &PB)
 PassPluginLibraryInfo 
 getFusionPassPluginInfo(void)
 {
-	uint32_t     APIversion =  LLVM_PLUGIN_API_VERSION;
-	const char * PluginName =  "fusion-pass";
-	const char * PluginVersion =  LLVM_VERSION_STRING;
+	uint32_t    APIversion    = LLVM_PLUGIN_API_VERSION;
+	const char *PluginName    = "fusion-pass";
+	const char *PluginVersion = LLVM_VERSION_STRING;
     
 	PassPluginLibraryInfo info = 
 	{ 

@@ -1,27 +1,37 @@
-#include <stdlib.h>
+#include <stdio.h>
 
-void fused() 
+void fused(unsigned n) 
 {
     int a = 0;
     int b = 0;
-    for (size_t i = 0; i < 228; i++) 
+    int c = 0;
+    for (unsigned i = 0; i < n; i++) 
     {
         a++;
         b++;
+	c++;
     }
 }
 
-void toBeFused() 
+void toBeFused(unsigned n) 
 {
     int a = 0;
     int b = 0;
-    for (size_t i = 0; i < 228; i++) 
+    int c = 0;
+    for (unsigned i = 0; i < n; i++) 
     {
         a++;
     }
-    for (size_t i = 0; i < 228; i++) 
+    for (unsigned i = 0; i < n; i++) 
     {
         b++;
+	printf("text");
+	//if (i) return;
     }
-
+    unsigned m = n;
+    c = -1;
+    for (unsigned i = 0; i < m; i++) 
+    {
+        c++;
+    }
 }

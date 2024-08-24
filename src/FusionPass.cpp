@@ -1,6 +1,10 @@
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Analysis/AssumptionCache.h"
+#include "llvm/Analysis/AliasAnalysis.h"
+#include "llvm/Analysis/DependenceAnalysis.h"
 #include "llvm/Analysis/PostDominators.h"
 #include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
@@ -54,6 +58,7 @@ loopHasMultipleEntriesAndExits(const Loop &L)
 	const BasicBlock *Header = L.getHeader();
 
 	if (Header->getTerminator()->getNumSuccessors() > 2) return true;
+	if (!L.getExitBlock()) return true;
 
 	for (const BasicBlock *BB : L.blocks())
 	{
@@ -133,6 +138,35 @@ isControlFlowEqLoops(const Loop *L1, const Loop *L2, const DominatorTree &DT, co
 	return (loopDominates(L1, L2, DT) && loopPostDominates(L2, L1, PDT));
 }
 
+Instruction *
+blockProducesValue(BasicBlock *BB, const Value *V)
+{
+	for (Instruction &I : *BB)
+	{
+		if (&I == V)
+		{
+			return &I;
+		}
+	}
+	return nullptr;
+}
+
+bool
+blockUsesValue(const BasicBlock *BB, const Value *V)
+{
+	for (const Instruction &I : *BB)
+	{
+		for (const Value *OP : I.operands())
+		{
+			if (OP == V)
+			{
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
 void
 fuse(Loop *L1, Loop *L2)
 {
@@ -141,25 +175,55 @@ fuse(Loop *L1, Loop *L2)
 	BasicBlock *Latch1 = L1->getLoopLatch(); /* Will be Latch */
 	BasicBlock *Latch2 = L2->getLoopLatch();
 	BasicBlock *PreHeader1 = L1->getLoopPreheader();
-	BasicBlock *PreHeader2 = L2->getLoopPreheader(); /* Will be deleted */
-	
+	BasicBlock *PreHeader2 = L2->getLoopPreheader(); /* Will be deleted */	
+
 	BasicBlock *BodyEntry2 = Header2->getTerminator()->getSuccessor(0);
 	BasicBlock *Exit2 = Header2->getTerminator()->getSuccessor(1);
+
+	assert(PreHeader2->size() == 1 && "Incorrect PreHeader size");
 
 	while (pred_begin(Latch1) != pred_end(Latch1))
 	{
 		(*(pred_begin(Latch1)))->getTerminator()->replaceSuccessorWith(Latch1, BodyEntry2);
 	}
+
+	/*while (pred_begin(Latch2) != pred_end(Latch2))
+	{
+		(*(pred_begin(Latch2)))->getTerminator()->replaceSuccessorWith(Latch2, Latch1);
+	}*/
+	Latch1->moveAfter(Latch2);
 	Instruction *Latch2Term = Latch2->getTerminator();
 	Latch2Term->replaceSuccessorWith(Header2, Latch1);
-	Latch1->moveAfter(Latch2);
 
 	Instruction *Header1Term = Header1->getTerminator();
 	Header1Term->replaceSuccessorWith(PreHeader2, Exit2);
 
 	/* Update phis' predecessors */
-	Header2->replacePhiUsesWith(Latch2, Latch1);
+	//Header2->replacePhiUsesWith(Latch2, Latch1);
 	Header2->replacePhiUsesWith(PreHeader2, PreHeader1);
+	//SmallVector<Instruction *> ToDelete;
+	/*if (false){
+	for (auto it = Header2->begin(); it != Header2->getFirstNonPHIIt();)
+	{
+		PHINode *Phi = dyn_cast<PHINode>(&*it);
+		const Value *V = Phi->getIncomingValueForBlock(Latch2);
+		Instruction *I;
+		if (I = blockContainsValue(Latch2, V))
+		{
+			outs() << "useless\n";
+			I->eraseFromParent();
+			Phi->eraseFromParent();
+			//Phi->removeIncomingValue(Latch2);
+			//Phi->setIncomingValueForBlock(Latch2, Phi->getIncomingValue(0));
+			//outs() << Phi->hasConstantValue() << "\n";
+		}
+		else ++it;
+	}}*/
+	//for (Instruction *I : ToDelete)
+	//{
+	//	I->removeFromParent();
+	//}
+	Header2->replacePhiUsesWith(Latch2, Latch1);
 
 	/* Move phis to Header1 */
 	Instruction *FirstNonPhi1 = Header1->getFirstNonPHI();
@@ -169,12 +233,14 @@ fuse(Loop *L1, Loop *L2)
 		Phi->removeFromParent();
 		Phi->insertBefore(FirstNonPhi1);
 	}
+	assert(Header2->size() == 2);
 	
 	/* Cleanup */
 	Latch2Term->setMetadata("llvm.loop", nullptr);
 
 	PreHeader2->eraseFromParent();
 	Header2->eraseFromParent();
+	//Latch2->eraseFromParent();
 }
 
 SmallVector<Loop *>
@@ -277,37 +343,261 @@ buildCFESets(const std::set<Loop *> &Candidates, const DominatorTree &DT, const 
 }
 
 bool
+blocksHaveNegativeDependencies(const BasicBlock &First, const BasicBlock &Second)
+{
+	for (const Instruction &I1 : First)
+	{
+		if (blockUsesValue(&Second, &I1))
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+bool
+loopsHaveInvalidDependencies(const Loop *L1, const Loop *L2)
+{
+	for (BasicBlock *BB1 : L1->blocks())
+	{
+		for (BasicBlock *BB2 : L2->blocks())
+		{
+			if (blocksHaveNegativeDependencies(*BB1, *BB2))
+			{
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+bool
 areLoopsAdjacent(const Loop *L1, const Loop *L2)
 {
-	SmallVector<BasicBlock *> Successors;
-	L1->getExitBlocks(Successors);
-	for (const BasicBlock *BB : Successors)
+	if (L2->getLoopPreheader()->size() > 1) 
 	{
-		if (BB != L2->getLoopPreheader())
+		return false;
+	}
+
+	BasicBlock *Exit1 = L1->getExitBlock();
+	if (!Exit1 || Exit1->size() > 1)
+	{
+		return false;
+	}
+
+	if (Exit1 != L2->getLoopPreheader())
+	{
+		return false;
+	}
+	return true;
+}
+
+bool
+tryMoveInterferingInstructions(Loop *L1, Loop *L2)
+{
+	DenseMap<BasicBlock *, int> WaysToMove; /* 10 - up; 01 - down; 11 both; 00 - can't move */
+	BasicBlock *Exit = L1->getExitBlock();
+	BasicBlock *BB = Exit->getSingleSuccessor();
+	while (BB != L2->getLoopPreheader())
+	{
+		WaysToMove.insert(std::make_pair(BB, 0b11));
+
+		for (BasicBlock *L1BB : L1->blocks())
+		{
+			for (Instruction &L1I : *L1BB)
+			{
+				if (blockUsesValue(BB, &L1I))
+				{
+					WaysToMove[BB] &= 0b01;
+				}
+			}
+		}
+		for (BasicBlock *L2BB : L2->blocks())
+		{
+			for (Instruction &I : *BB)
+			{
+				if (blockUsesValue(L2BB, &I))
+				{
+					WaysToMove[BB] &= 0b10;
+				}
+			}
+		}
+		if (WaysToMove.at(BB) == 0b00)
 		{
 			return false;
+		}
+		BB = BB->getSingleSuccessor();
+	}
+
+	BasicBlock *PreHeader1 = L1->getLoopPreheader();
+	for (auto &pair : WaysToMove)
+	{
+		BasicBlock *BBToMove = pair.first;
+		if (pair.second & 0b10)
+		{
+			while (pred_begin(BBToMove) != pred_end(BBToMove))
+			{
+				(*(pred_begin(BBToMove)))->getTerminator()->replaceSuccessorWith(BBToMove, BBToMove->getSingleSuccessor());
+			}
+			while (pred_begin(PreHeader1) != pred_end(PreHeader1))
+			{
+				(*(pred_begin(PreHeader1)))->getTerminator()->replaceSuccessorWith(PreHeader1, BBToMove);
+			}
+			BBToMove->getTerminator()->replaceSuccessorWith(BBToMove->getSingleSuccessor(), PreHeader1);
 		}
 	}
 	return true;
 }
 
 bool
-tryMakeLoopsAdjacent(Loop *L1, Loop *L2)
+tryCleanPreHeader(Loop *L1, Loop *L2)
 {
-	BasicBlock *Exit = L1->getExitBlock();
-	if (Exit == nullptr) return false;
-	if (Exit->getSingleSuccessor() != L2->getLoopPreheader())
+	DenseMap<Instruction *, int> WaysToMove;
+
+	BasicBlock *Exit1 = L1->getExitBlock();
+	BasicBlock *PreHeader2 = L2->getLoopPreheader();
+	if (Exit1 != PreHeader2) assert(Exit1->size() == 1 && Exit1->getSingleSuccessor() == PreHeader2);
+
+	for (Instruction &I : *PreHeader2)
 	{
-		outs() << "can not make adj\n";
-		return false;
+		if (&I == PreHeader2->getTerminator())
+		{
+			break;
+		}
+		WaysToMove.insert(std::make_pair(&I, 0b11));
+		for (BasicBlock *L1BB : L1->blocks())
+		{
+			for (Value *V : I.operands())
+			{
+				if (blockProducesValue(L1BB, V))
+				{
+					WaysToMove[&I] &= 0b01;
+				}
+			}
+		}
+
+		for (BasicBlock *L2BB : L2->blocks())
+		{
+			if (blockUsesValue(L2BB, &I))
+			{
+				WaysToMove[&I] &= 0b10;
+			}
+		}
+		if (WaysToMove.at(&I) == 0b00)
+		{
+			return false;
+		}
 	}
 
-	while (pred_begin(Exit) != pred_end(Exit))
+	BasicBlock *PreHeader1 = L1->getLoopPreheader();
+	Instruction *PreHeader1Term = PreHeader1->getTerminator();
+	int move = 0b11;
+	for (auto &pair : WaysToMove)
 	{
-		(*(pred_begin(Exit)))->getTerminator()->replaceSuccessorWith(Exit, Exit->getSingleSuccessor());
+		move &= pair.second;
 	}
-	Exit->eraseFromParent();
+	/*for (auto &pair : WaysToMove)
+	{
+		Instruction *I = pair.first;
+		//int move = pair.second;
+		
+		if (move & 0b10)
+		{
+			I->moveBefore(PreHeader1Term);
+		}
+		else
+		{
+			I->moveBefore(&*(L2->getExitBlock()->begin()));
+		}
+	}*/
+	if (move & 0b10)
+	{
+		while (&*(PreHeader2->begin()) != PreHeader2->getTerminator())
+		{
+			(&*(PreHeader2->begin()))->moveBefore(PreHeader1Term);
+		}
+	}
+	else if (move & 0b01)
+	{
+		Instruction *Exit2Start = &*(L2->getExitBlock()->begin());
+		while (&*(PreHeader2->begin()) != PreHeader2->getTerminator())
+		{
+			(&*(PreHeader2->begin()))->moveBefore(Exit2Start);
+		}
+	}
+	else
+	{
+		return false;
+	}
+	assert(PreHeader2->size() == 1 && "Incorrect PreHeader cleaning");
 	return true;
+}
+
+bool
+tryCleanExit(Loop *L1, Loop *L2)
+{
+	BasicBlock *Exit1 = L1->getExitBlock();
+	BasicBlock *PreHeader2 = L2->getLoopPreheader();
+	if (Exit1 == PreHeader2)
+	{
+		return true;
+	}
+
+	assert(Exit1->getSingleSuccessor() == PreHeader2);
+
+	while (&*(Exit1->begin()) != Exit1->getTerminator())
+	{
+		(&*(Exit1->begin()))->moveBefore(&*(PreHeader2->begin()));
+	}
+	/* For now always returns true */
+	return true;
+}
+
+bool
+tryCleanExitAndPreHeader(Loop *L1, Loop *L2)
+{
+	return tryCleanExit(L1, L2) && tryCleanPreHeader(L1, L2);
+}
+
+bool
+tryMakeLoopsAdjacent(Loop *L1, Loop *L2)
+{
+	if (areLoopsAdjacent(L1, L2))
+	{
+		return true;
+	}
+	//return false;
+
+	BasicBlock *Exit = L1->getExitBlock();
+	if (Exit == nullptr) return false;
+
+	BasicBlock *PreHeader2 = L2->getLoopPreheader();
+	//outs() << "\tpre size: " << PreHeader2->size() << "\n";
+	if (Exit->size() > 1 || PreHeader2->size() > 1)
+	{
+		if (tryCleanExitAndPreHeader(L1, L2) == false)
+		{
+			outs() << "can not clean pre header\n";
+			return false;
+		}
+	}
+
+	if (Exit->getSingleSuccessor() == PreHeader2)
+	{
+		while (pred_begin(Exit) != pred_end(Exit))
+		{
+			(*(pred_begin(Exit)))->getTerminator()->replaceSuccessorWith(Exit, PreHeader2);
+		}
+		Exit->eraseFromParent();
+	}
+	if (L1->getExitBlock() == L2->getLoopPreheader() && L2->getLoopPreheader()->size() == 1)
+	{
+		return true;
+	}
+
+	//outs() << "can not make adj\n";
+	return false;
+	return tryMoveInterferingInstructions(L1, L2);
 }
 
 bool
@@ -331,12 +621,13 @@ processSet(std::list<Loop *> &set, const DenseMap<const BasicBlock *, const SCEV
 			{
 				continue;
 			}
-			if (areLoopsAdjacent(L1, L2) == false)
+			if (false &&loopsHaveInvalidDependencies(L1, L2))
 			{
-				if (tryMakeLoopsAdjacent(L1, L2) == false)
-				{
-					continue;
-				}
+				continue;
+			}
+			if (tryMakeLoopsAdjacent(L1, L2) == false)
+			{
+				continue;
 			}
 			/* Finally, fuse loops */
 			fuse(L1, L2);
@@ -399,6 +690,10 @@ FuseLoops(Function &F, FunctionAnalysisManager &FAM)
 	LoopInfo          &LI  = FAM.getResult<LoopAnalysis>(F);
 	DominatorTree     &DT  = FAM.getResult<DominatorTreeAnalysis>(F);
 	PostDominatorTree &PDT = FAM.getResult<PostDominatorTreeAnalysis>(F);
+	//DependenceInfo    &DI  = FAM.getResult<DependenceAnalysis>(F);
+	//TargetLibraryInfo &TLI = FAM.getResult<TargetLibraryAnalysis>(F);
+	//AssumptionCache   &AC  = FAM.getResult<AssumptionAnalysis>(F);
+	//AAResults	  &AA  = FAM.getResult<AliasAnalysis>(F);
 	ScalarEvolution   &SE  = FAM.getResult<ScalarEvolutionAnalysis>(F);
 
 	/* Store important Scalar Evolution info in map<Header *, SCEV *> */
@@ -407,7 +702,6 @@ FuseLoops(Function &F, FunctionAnalysisManager &FAM)
 	SmallVector<Loop *> LoopsToProcess;
 	for (unsigned i = 1; (LoopsToProcess = collectLoopsAtDepth(LI, i)).empty() == false;)
 	{
-		
 		FusedAny = processLoops(LoopsToProcess, DT, PDT, LoopSCEVInfo);
 		if (FusedAny)
 		{

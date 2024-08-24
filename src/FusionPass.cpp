@@ -187,10 +187,6 @@ fuse(Loop *L1, Loop *L2)
 		(*(pred_begin(Latch1)))->getTerminator()->replaceSuccessorWith(Latch1, BodyEntry2);
 	}
 
-	/*while (pred_begin(Latch2) != pred_end(Latch2))
-	{
-		(*(pred_begin(Latch2)))->getTerminator()->replaceSuccessorWith(Latch2, Latch1);
-	}*/
 	Latch1->moveAfter(Latch2);
 	Instruction *Latch2Term = Latch2->getTerminator();
 	Latch2Term->replaceSuccessorWith(Header2, Latch1);
@@ -199,30 +195,7 @@ fuse(Loop *L1, Loop *L2)
 	Header1Term->replaceSuccessorWith(PreHeader2, Exit2);
 
 	/* Update phis' predecessors */
-	//Header2->replacePhiUsesWith(Latch2, Latch1);
 	Header2->replacePhiUsesWith(PreHeader2, PreHeader1);
-	//SmallVector<Instruction *> ToDelete;
-	/*if (false){
-	for (auto it = Header2->begin(); it != Header2->getFirstNonPHIIt();)
-	{
-		PHINode *Phi = dyn_cast<PHINode>(&*it);
-		const Value *V = Phi->getIncomingValueForBlock(Latch2);
-		Instruction *I;
-		if (I = blockContainsValue(Latch2, V))
-		{
-			outs() << "useless\n";
-			I->eraseFromParent();
-			Phi->eraseFromParent();
-			//Phi->removeIncomingValue(Latch2);
-			//Phi->setIncomingValueForBlock(Latch2, Phi->getIncomingValue(0));
-			//outs() << Phi->hasConstantValue() << "\n";
-		}
-		else ++it;
-	}}*/
-	//for (Instruction *I : ToDelete)
-	//{
-	//	I->removeFromParent();
-	//}
 	Header2->replacePhiUsesWith(Latch2, Latch1);
 
 	/* Move phis to Header1 */
@@ -233,6 +206,20 @@ fuse(Loop *L1, Loop *L2)
 		Phi->removeFromParent();
 		Phi->insertBefore(FirstNonPhi1);
 	}
+	for (auto it1 = Header1->phis().begin(), it1e = Header1->phis().end(); it1 != it1e; ++it1)
+	{
+		Value *V = &*it1;
+		const PHINode &Phi1 = *it1;
+		for (auto it2 = std::next(it1), it2e = it1e; it2 != it2e; ++it2)
+		{
+			PHINode &Phi2 = *it2;
+			if (Phi2.getIncomingValueForBlock(PreHeader1) == V)
+			{
+				Value *VNew = Phi1.getIncomingValueForBlock(PreHeader1);
+				Phi2.setIncomingValueForBlock(PreHeader1, VNew);
+			}
+		}
+	}
 	assert(Header2->size() == 2);
 	
 	/* Cleanup */
@@ -240,7 +227,6 @@ fuse(Loop *L1, Loop *L2)
 
 	PreHeader2->eraseFromParent();
 	Header2->eraseFromParent();
-	//Latch2->eraseFromParent();
 }
 
 SmallVector<Loop *>

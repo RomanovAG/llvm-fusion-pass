@@ -10,47 +10,10 @@
 #include "llvm/Passes/PassPlugin.h"
 #include "llvm/Support/raw_ostream.h"
 #include <set>
-#include <vector>
 
 using namespace llvm;
 
 namespace {
-
-/*bool
-instMightThrowException(const Instruction &I)
-{
-	if (isa<CallInst>(I) || isa<InvokeInst>(I))
-	{
-		if (Function *CalledFunc = I.getCalledFunction())
-		{
-			if (CalledFunc->isDeclaration())
-			{
-				if (!CalledFunc->hasFnAttribute(Attribute::NoUnwind))
-				{
-					return true;
-				}
-			}
-			else
-			{
-				for (BasicBlock &BB : *CalledFunc)
-				{
-					for (Instruction &I : BB)
-					{
-						if (instMightThrowException(I))
-						{
-							return true;
-						}
-					}
-				}
-			}
-		}
-	}
-	if (isa<LandingPadInst>(I))
-	{
-		return true;
-	}
-	return false;
-}*/
 
 bool
 loopHasMultipleEntriesAndExits(const Loop &L)
@@ -58,6 +21,7 @@ loopHasMultipleEntriesAndExits(const Loop &L)
 	const BasicBlock *Header = L.getHeader();
 
 	if (Header->getTerminator()->getNumSuccessors() > 2) return true;
+	if (!L.getExitingBlock()) return true;
 	if (!L.getExitBlock()) return true;
 
 	for (const BasicBlock *BB : L.blocks())
@@ -138,35 +102,6 @@ isControlFlowEqLoops(const Loop *L1, const Loop *L2, const DominatorTree &DT, co
 	return (loopDominates(L1, L2, DT) && loopPostDominates(L2, L1, PDT));
 }
 
-Instruction *
-blockProducesValue(BasicBlock *BB, const Value *V)
-{
-	for (Instruction &I : *BB)
-	{
-		if (&I == V)
-		{
-			return &I;
-		}
-	}
-	return nullptr;
-}
-
-bool
-blockUsesValue(const BasicBlock *BB, const Value *V)
-{
-	for (const Instruction &I : *BB)
-	{
-		for (const Value *OP : I.operands())
-		{
-			if (OP == V)
-			{
-				return true;
-			}
-		}
-	}
-	return false;
-}
-
 void
 fuse(Loop *L1, Loop *L2)
 {
@@ -176,11 +111,12 @@ fuse(Loop *L1, Loop *L2)
 	BasicBlock *Latch2 = L2->getLoopLatch();
 	BasicBlock *PreHeader1 = L1->getLoopPreheader();
 	BasicBlock *PreHeader2 = L2->getLoopPreheader(); /* Will be deleted */	
+//assert(Latch1->size() == Latch2->size() == 2);
 
 	BasicBlock *BodyEntry2 = Header2->getTerminator()->getSuccessor(0);
 	BasicBlock *Exit2 = Header2->getTerminator()->getSuccessor(1);
 
-	assert(PreHeader2->size() == 1 && "Incorrect PreHeader size");
+	assert(PreHeader2->size() == 1 && "Incorrect PreHeader2 size");
 
 	while (pred_begin(Latch1) != pred_end(Latch1))
 	{
@@ -195,6 +131,22 @@ fuse(Loop *L1, Loop *L2)
 	Header1Term->replaceSuccessorWith(PreHeader2, Exit2);
 
 	/* Update phis' predecessors */
+	for (PHINode &Phi1 : Header1->phis())
+	{
+		int idx1 = Phi1.getBasicBlockIndex(Latch1);
+		if (idx1 > -1)
+		{
+			Value *V = Phi1.getIncomingValue(idx1);
+			for (PHINode &Phi2 : Header2->phis())
+			{
+				int idx2 = Phi2.getBasicBlockIndex(Latch2);
+				if (idx2 > -1)
+				{
+					Phi2.setIncomingValue(idx2, V);
+				}
+			}
+		}
+	}
 	Header2->replacePhiUsesWith(PreHeader2, PreHeader1);
 	Header2->replacePhiUsesWith(Latch2, Latch1);
 
@@ -206,6 +158,8 @@ fuse(Loop *L1, Loop *L2)
 		Phi->removeFromParent();
 		Phi->insertBefore(FirstNonPhi1);
 	}
+
+	/* Handle case when one phi-node uses value produced by another in the same BB */
 	for (auto it1 = Header1->phis().begin(), it1e = Header1->phis().end(); it1 != it1e; ++it1)
 	{
 		Value *V = &*it1;
@@ -220,13 +174,19 @@ fuse(Loop *L1, Loop *L2)
 			}
 		}
 	}
-	assert(Header2->size() == 2);
+	assert(Header2->size() == 2 && "Incorrect Header2 size");
+	
+	while (pred_begin(Latch2) != pred_end(Latch2))
+	{
+		(*(pred_begin(Latch2)))->getTerminator()->replaceSuccessorWith(Latch2, Latch1);
+	}
+	//outs() << "\tsiz: " << Latch1->size() << "\n";
+
 	
 	/* Cleanup */
-	Latch2Term->setMetadata("llvm.loop", nullptr);
-
 	PreHeader2->eraseFromParent();
 	Header2->eraseFromParent();
+	Latch2->eraseFromParent();
 }
 
 SmallVector<Loop *>
@@ -328,27 +288,27 @@ buildCFESets(const std::set<Loop *> &Candidates, const DominatorTree &DT, const 
 	return CFEs;
 }
 
-bool
-blocksHaveNegativeDependencies(const BasicBlock &First, const BasicBlock &Second)
+Instruction *
+blockProducesValue(BasicBlock *BB, const Value *V)
 {
-	for (const Instruction &I1 : First)
+	for (Instruction &I : *BB)
 	{
-		if (blockUsesValue(&Second, &I1))
+		if (&I == V)
 		{
-			return true;
+			return &I;
 		}
 	}
-	return false;
+	return nullptr;
 }
 
 bool
-loopsHaveInvalidDependencies(const Loop *L1, const Loop *L2)
+blockUsesValue(const BasicBlock *BB, const Value *V)
 {
-	for (BasicBlock *BB1 : L1->blocks())
+	for (const Instruction &I : *BB)
 	{
-		for (BasicBlock *BB2 : L2->blocks())
+		for (const Value *OP : I.operands())
 		{
-			if (blocksHaveNegativeDependencies(*BB1, *BB2))
+			if (OP == V)
 			{
 				return true;
 			}
@@ -358,20 +318,125 @@ loopsHaveInvalidDependencies(const Loop *L1, const Loop *L2)
 }
 
 bool
+blocksHaveNegativeDependencies(const BasicBlock &First, const BasicBlock &Second)
+{
+	for (const Instruction &I1 : First)
+	{
+		if (I1.getOpcode() == Instruction::Store)
+		{
+			//outs() << "store\n";
+			for (Value *V : I1.operands())
+			{
+				if (blockUsesValue(&Second, V))
+				{
+					return true;
+				}
+			}
+		}
+		if (blockUsesValue(&Second, &I1))
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+bool
+areSameIndex(const Instruction &I1, const Instruction &I2)
+{
+	bool first = false;
+	bool second = false;
+	const Instruction *IPtr1 = dyn_cast<Instruction>(I1.getOperand(1));
+	if (IPtr1->getOpcode() == Instruction::SExt)
+	{
+		IPtr1 = dyn_cast<Instruction>(IPtr1->getOperand(0));
+	}
+	if (IPtr1->getOpcode() == Instruction::PHI)
+	{
+		const BasicBlock *Parent1 = IPtr1->getParent();
+		for (auto it = Parent1->getFirstNonPHIIt(), ite = Parent1->end(); it != ite; ++it)
+		{
+			if (it->getOpcode() == Instruction::ICmp && it->getOperand(0) == IPtr1)
+			{
+				if (Parent1->getTerminator()->getOperand(0) == &*it)
+				{
+					first = true;
+				}
+			}
+		}
+	}
+	const Instruction *IPtr2 = dyn_cast<Instruction>(I2.getOperand(1));
+	if (IPtr2->getOpcode() == Instruction::SExt)
+	{
+		IPtr2 = dyn_cast<Instruction>(IPtr2->getOperand(0));
+	}
+	if (IPtr2->getOpcode() == Instruction::PHI)
+	{
+		const BasicBlock *Parent2 = IPtr2->getParent();
+		for (auto it = Parent2->getFirstNonPHIIt(), ite = Parent2->end(); it != ite; ++it)
+		{
+			if (it->getOpcode() == Instruction::ICmp && it->getOperand(0) == IPtr2)
+			{
+				if (Parent2->getTerminator()->getOperand(0) == &*it)
+				{
+					second = true;
+				}
+			}
+		}
+	}
+	return first & second;
+}
+
+bool
+loopsHaveInvalidDependencies(const Loop *L1, const Loop *L2, DependenceInfo &DI)
+{
+	for (BasicBlock *BB1 : L1->blocks())
+	{
+		for (Instruction &I1 : *BB1)
+		{
+			for (BasicBlock *BB2 : L2->blocks())
+			{
+				for (Instruction &I2 : *BB2)
+				{
+					if (const auto Dep = DI.depends(&I1, &I2, true))
+					{
+						if (Dep->isFlow())
+						{
+							//outs() << "Entereddep\n";
+							//outs() << Dep->getSrc()->getNumOperands() << "\n";
+							Instruction *Src, *Dst;
+							if ((Src = dyn_cast<Instruction>(Dep->getSrc()->getOperand(1))) && (Dst = dyn_cast<Instruction>(Dep->getDst()->getOperand(0))))
+							{
+								if (Src->getOpcode() == Instruction::GetElementPtr && Dst->getOpcode() == Instruction::GetElementPtr)
+								{
+									if (areSameIndex(*Src, *Dst))
+									{
+										outs() << "\ta[i]\n";
+										continue;
+									}
+								}
+							}
+							return true;
+						}
+					}
+				}
+			}
+		}
+	}
+	return false;
+}
+
+bool
 areLoopsAdjacent(const Loop *L1, const Loop *L2)
 {
-	if (L2->getLoopPreheader()->size() > 1) 
-	{
-		return false;
-	}
-
 	BasicBlock *Exit1 = L1->getExitBlock();
-	if (!Exit1 || Exit1->size() > 1)
+	assert(Exit1 && "Loop 1 has no exit block");
+	if (Exit1 != L2->getLoopPreheader())
 	{
 		return false;
 	}
-
-	if (Exit1 != L2->getLoopPreheader())
+	
+	if (Exit1->size() > 1)
 	{
 		return false;
 	}
@@ -379,7 +444,7 @@ areLoopsAdjacent(const Loop *L1, const Loop *L2)
 }
 
 bool
-tryMoveInterferingInstructions(Loop *L1, Loop *L2)
+tryMoveInterferingCode(Loop *L1, Loop *L2, DependenceInfo &DI)
 {
 	DenseMap<BasicBlock *, int> WaysToMove; /* 10 - up; 01 - down; 11 both; 00 - can't move */
 	BasicBlock *Exit = L1->getExitBlock();
@@ -438,7 +503,7 @@ tryMoveInterferingInstructions(Loop *L1, Loop *L2)
 bool
 tryCleanPreHeader(Loop *L1, Loop *L2)
 {
-	DenseMap<Instruction *, int> WaysToMove;
+	DenseMap<Instruction *, int> WaysToMove; /* 10 - up; 01 - down; 11 both; 00 - can't move */
 
 	BasicBlock *Exit1 = L1->getExitBlock();
 	BasicBlock *PreHeader2 = L2->getLoopPreheader();
@@ -482,20 +547,8 @@ tryCleanPreHeader(Loop *L1, Loop *L2)
 	{
 		move &= pair.second;
 	}
-	/*for (auto &pair : WaysToMove)
-	{
-		Instruction *I = pair.first;
-		//int move = pair.second;
-		
-		if (move & 0b10)
-		{
-			I->moveBefore(PreHeader1Term);
-		}
-		else
-		{
-			I->moveBefore(&*(L2->getExitBlock()->begin()));
-		}
-	}*/
+
+	/* Move entire set of instructions up or down */
 	if (move & 0b10)
 	{
 		while (&*(PreHeader2->begin()) != PreHeader2->getTerminator())
@@ -546,20 +599,24 @@ tryCleanExitAndPreHeader(Loop *L1, Loop *L2)
 }
 
 bool
-tryMakeLoopsAdjacent(Loop *L1, Loop *L2)
+tryMakeLoopsAdjacent(Loop *L1, Loop *L2, DependenceInfo &DI)
 {
 	if (areLoopsAdjacent(L1, L2))
 	{
 		return true;
 	}
-	//return false;
 
-	BasicBlock *Exit = L1->getExitBlock();
-	if (Exit == nullptr) return false;
-
+	BasicBlock *Exit1 = L1->getExitBlock();
 	BasicBlock *PreHeader2 = L2->getLoopPreheader();
-	//outs() << "\tpre size: " << PreHeader2->size() << "\n";
-	if (Exit->size() > 1 || PreHeader2->size() > 1)
+	if (Exit1 != PreHeader2 && Exit1->getSingleSuccessor() != PreHeader2)
+	{
+		if (tryMoveInterferingCode(L1, L2, DI) == false)
+		{
+			return false;
+		}
+	}
+
+	if (Exit1->size() > 1 || PreHeader2->size() > 1)
 	{
 		if (tryCleanExitAndPreHeader(L1, L2) == false)
 		{
@@ -568,13 +625,13 @@ tryMakeLoopsAdjacent(Loop *L1, Loop *L2)
 		}
 	}
 
-	if (Exit->getSingleSuccessor() == PreHeader2)
+	if (Exit1->getSingleSuccessor() == PreHeader2)
 	{
-		while (pred_begin(Exit) != pred_end(Exit))
+		while (pred_begin(Exit1) != pred_end(Exit1))
 		{
-			(*(pred_begin(Exit)))->getTerminator()->replaceSuccessorWith(Exit, PreHeader2);
+			(*(pred_begin(Exit1)))->getTerminator()->replaceSuccessorWith(Exit1, PreHeader2);
 		}
-		Exit->eraseFromParent();
+		Exit1->eraseFromParent();
 	}
 	if (L1->getExitBlock() == L2->getLoopPreheader() && L2->getLoopPreheader()->size() == 1)
 	{
@@ -583,11 +640,10 @@ tryMakeLoopsAdjacent(Loop *L1, Loop *L2)
 
 	//outs() << "can not make adj\n";
 	return false;
-	return tryMoveInterferingInstructions(L1, L2);
 }
 
 bool
-processSet(std::list<Loop *> &set, const DenseMap<const BasicBlock *, const SCEV *> &LoopSCEVInfo)
+processSet(std::list<Loop *> &set, ScalarEvolution &SE, DependenceInfo &DI)
 {
 	for (auto it1 = set.begin(), it1e = set.end(); it1 != it1e; ++it1)
 	{
@@ -595,26 +651,26 @@ processSet(std::list<Loop *> &set, const DenseMap<const BasicBlock *, const SCEV
 		for (auto it2 = std::next(it1), it2e = set.end(); it2 != it2e; ++it2)
 		{
 			Loop *L2 = *it2;
-			const SCEV *TripCount1 = LoopSCEVInfo.at(L1->getHeader());
-			const SCEV *TripCount2 = LoopSCEVInfo.at(L2->getHeader());
+			const SCEV *TripCount1 = SE.getSymbolicMaxBackedgeTakenCount(L1);
+			const SCEV *TripCount2 = SE.getSymbolicMaxBackedgeTakenCount(L2);
 			if (TripCount1->getSCEVType() == SCEVTypes::scCouldNotCompute ||
 				TripCount2->getSCEVType() == SCEVTypes::scCouldNotCompute)
 			{
-				outs() << "cncompute\n";
 				continue;
 			}
 			if (TripCount1 != TripCount2)
 			{
 				continue;
 			}
-			if (false &&loopsHaveInvalidDependencies(L1, L2))
+			if (loopsHaveInvalidDependencies(L1, L2, DI))
 			{
 				continue;
 			}
-			if (tryMakeLoopsAdjacent(L1, L2) == false)
+			if (tryMakeLoopsAdjacent(L1, L2, DI) == false)
 			{
 				continue;
 			}
+
 			/* Finally, fuse loops */
 			fuse(L1, L2);
 			return true;
@@ -624,7 +680,7 @@ processSet(std::list<Loop *> &set, const DenseMap<const BasicBlock *, const SCEV
 }
 
 bool
-processLoops(const SmallVector<Loop *> &Loops, const DominatorTree &DT, const PostDominatorTree &PDT, const DenseMap<const BasicBlock *, const SCEV *> &LoopSCEVInfo)
+processLoops(const SmallVector<Loop *> &Loops, const DominatorTree &DT, const PostDominatorTree &PDT, ScalarEvolution &SE, DependenceInfo &DI)
 {
 	/* Collect candidates */
 	std::set<Loop *> Candidates;
@@ -648,11 +704,12 @@ processLoops(const SmallVector<Loop *> &Loops, const DominatorTree &DT, const Po
 	bool fused = false;
 	for (auto &set : CFEs)
 	{
-		fused |= processSet(set, LoopSCEVInfo);
+		fused |= processSet(set, SE, DI);
 	}
 	return fused;
 }
 
+/* Deprecated */
 DenseMap<const BasicBlock *, const SCEV *>
 getLoopSCEVInfo(const LoopInfo &LI, ScalarEvolution &SE)
 {
@@ -669,49 +726,53 @@ getLoopSCEVInfo(const LoopInfo &LI, ScalarEvolution &SE)
 bool
 FuseLoops(Function &F, FunctionAnalysisManager &FAM)
 {
-	bool FusedAny = false;
+	bool changed = false;
 	outs() << "Func: " << F.getName() << "\n";
 
-	/* Get analyses */
-	LoopInfo          &LI  = FAM.getResult<LoopAnalysis>(F);
-	DominatorTree     &DT  = FAM.getResult<DominatorTreeAnalysis>(F);
-	PostDominatorTree &PDT = FAM.getResult<PostDominatorTreeAnalysis>(F);
-	//DependenceInfo    &DI  = FAM.getResult<DependenceAnalysis>(F);
-	//TargetLibraryInfo &TLI = FAM.getResult<TargetLibraryAnalysis>(F);
-	//AssumptionCache   &AC  = FAM.getResult<AssumptionAnalysis>(F);
-	//AAResults	  &AA  = FAM.getResult<AliasAnalysis>(F);
-	ScalarEvolution   &SE  = FAM.getResult<ScalarEvolutionAnalysis>(F);
-
-	/* Store important Scalar Evolution info in map<Header *, SCEV *> */
-	auto LoopSCEVInfo = getLoopSCEVInfo(LI, SE);
-	outs() << "\tloop count before: " << LI.getLoopsInPreorder().size() << "\n";
+	unsigned LoopCount = FAM.getResult<LoopAnalysis>(F).getLoopsInPreorder().size();
+	outs() << "\tloop count before: " << LoopCount << "\n";
 	SmallVector<Loop *> LoopsToProcess;
-	for (unsigned i = 1; (LoopsToProcess = collectLoopsAtDepth(LI, i)).empty() == false;)
+	unsigned i = 1;
+	while (true)
 	{
-		FusedAny = processLoops(LoopsToProcess, DT, PDT, LoopSCEVInfo);
+		/* Get analyses */
+		LoopInfo          &LI  = FAM.getResult<LoopAnalysis>(F);
+		DominatorTree     &DT  = FAM.getResult<DominatorTreeAnalysis>(F);
+		PostDominatorTree &PDT = FAM.getResult<PostDominatorTreeAnalysis>(F);
+		ScalarEvolution   &SE  = FAM.getResult<ScalarEvolutionAnalysis>(F);
+		DependenceInfo    &DI  = FAM.getResult<DependenceAnalysis>(F);
+
+		LoopsToProcess = collectLoopsAtDepth(LI, i);
+		if (LoopsToProcess.empty())
+		{
+			break;
+		}
+
+		bool FusedAny = processLoops(LoopsToProcess, DT, PDT, SE, DI);
 		if (FusedAny)
 		{
-			/* Recalculate analyses since CFG changed */
-			DT  = DominatorTree(F);
-			PDT = PostDominatorTree(F);
-			LI  = LoopInfo(DT);
+			changed = true;
+
+			/* Invalidate analyses since CFG changed */
+			FAM.invalidate(F, PreservedAnalyses::none());
 		}
 		else
 		{
 			i++;
 		}
 	}
-	outs()	<< "\tloop count after: "
-		<< LI.getLoopsInPreorder().size() << "\n";
-	return FusedAny;
+	if (changed)
+		LoopCount = FAM.getResult<LoopAnalysis>(F).getLoopsInPreorder().size();
+	outs()	<< "\tloop count after : " << LoopCount << "\n";
+	return changed;
 }
 
 struct FusionPass : PassInfoMixin<FusionPass> 
 {
 	PreservedAnalyses 
-	run(Function &F, FunctionAnalysisManager &AnalysisManager) 
+	run(Function &F, FunctionAnalysisManager &FAM) 
 	{
-		bool changed = FuseLoops(F, AnalysisManager);
+		bool changed = FuseLoops(F, FAM);
 		return changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 	}
 

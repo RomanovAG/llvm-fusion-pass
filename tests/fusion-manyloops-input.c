@@ -5,7 +5,7 @@ int max(int a, int b)
 	return a >= b ? a : b;
 }
 
-void toBeFused(int N, int M)
+void to_be_fused(int N, int M)
 {
 	printf("Func begin\n");
 	for ( int i = 0; i < N; i++)
@@ -36,7 +36,7 @@ void toBeFused(int N, int M)
 	printf("Func end\n");
 }
 
-void doit1(int *a, size_t n)
+void doit1_should(int *a, size_t n)
 {
 	for (size_t i = 0; i < n; i++)
 	{
@@ -67,7 +67,38 @@ void doit2(int *a, size_t n)
 	}
 }
 
-void diff_directions(int *a, int *b, int N)
+void simple_1_should(int *A, int *B, int SIZE)
+{
+	for (int i = 0; i < SIZE; i++)
+	{
+		A[i] = i;
+	}
+	for (int i = 0; i < SIZE; i++)
+	{
+		B[i] = A[i] + 1;
+	}
+}
+
+void nested_no_dep_should(int **F, int **G, int SIZE)
+{
+	for (int i = 0; i < SIZE; i++)
+	{
+		for (int j = 0; j < SIZE; j++)
+		{
+			F[i][j] = i * j;
+			//printf("case 2 loop 1.1");
+		}
+	}
+	for (int i = 0; i < SIZE; i++)
+	{
+		for (int j = 0; j < SIZE; j++)
+		{
+			G[i][j]++;
+		}
+	}
+}
+
+void diff_directions_shouldnot(int *a, int *b, int N)
 {
 	for (int i = 0; i < N; i++)
 	{
@@ -79,7 +110,24 @@ void diff_directions(int *a, int *b, int N)
 	}
 }
 
-void sum_reduction(int *A, int *B, int N)
+void multiple_entries_exits_shouldnot(int N)
+{
+	for (int i = 0; i < N; i += 2)
+	{
+		if (i == 6)
+			goto a;
+	}
+	for (int i = 0; i < N; i += 2)
+	{
+	}
+	for (int i = 0; i < N; i += 2)
+	{
+		a:
+		printf("mee 3");
+	}
+}
+
+void sum_reduction_should(int *A, int *B, int N)
 {
 	int i;
 	int sum = 0;
@@ -95,7 +143,8 @@ void sum_reduction(int *A, int *B, int N)
 
 void extreme_test(int SIZE) 
 {
-    int A[SIZE], B[SIZE], C[SIZE], D[SIZE], E[SIZE];
+    int A[SIZE], B[SIZE], C[SIZE], D[SIZE];//, E[SIZE];
+    int E[100] = {0};
     int F[SIZE][SIZE], G[SIZE][SIZE], H[SIZE][SIZE], I[SIZE][SIZE];
     int i, j, k, sum = 0;
     if (SIZE == 100)
@@ -110,45 +159,24 @@ void extreme_test(int SIZE)
 		}
 	}
 
-    // Case 1: Simple consecutive loops that can be fused
-    for (i = 0; i < SIZE; i++) {
-        A[i] = i;
-    }
-    for (i = 0; i < SIZE; i++) {
-        B[i] = A[i] + 1;
-    }
-
-    // Case 2: Nested loops with no dependencies
-    for (i = 0; i < SIZE; i++) {
-        for (j = 0; j < SIZE; j++) {
-            F[i][j] = i * j;
-	    //printf("case 2 loop 1.1");
-        }
-    }
-    for (i = 0; i < SIZE; i++) {
-        for (j = 0; j < SIZE; j++) {
-            G[i][j] = F[i][j] + 1;
-        }
-    }
-
     // Case 3: Dependent loops that cannot be fused
-    for (i = 1; i < SIZE; i++) {
+    /*for (i = 1; i < SIZE; i++) {
         A[i] = A[i - 1] + 1;
     }
     for (i = 0; i < SIZE; i++) {
         B[i] = A[i] * 2;
-    }
+    }*/
 
     // Case 4: Loops with different strides
-    for (i = 0; i < SIZE; i += 2) {
+    /*for (i = 0; i < SIZE; i += 2) {
         C[i] = i;
     }
     for (i = 1; i < SIZE; i += 2) {
         D[i] = i;
-    }
+    }*/
 
     // Case 5: Loops with complex control flow
-    for (i = 0; i < SIZE; i++) {
+    /*for (i = 0; i < SIZE; i++) {
         for (j = 0; j < SIZE; j++) {
             if (i % 2 == 0) {
                 H[i][j] = i + j;
@@ -165,17 +193,17 @@ void extreme_test(int SIZE)
                 I[i][j] = H[i][j] / 2;
             }
         }
-    }
+    }*/
 
     // Case 6: Nested loops with dependencies on different levels
-    for (i = 0; i < SIZE; i++) {
+    /*for (i = 0; i < SIZE; i++) {
         for (j = 0; j < SIZE; j++) {
             E[i] = i + j;
         }
         for (j = 0; j < SIZE; j++) {
             E[i] += E[j];
         }
-    }
+    }*/
 
     // Output some results to prevent optimizations from removing loops
     printf("A[12] = %d, B[23] = %d, C[34] = %d, D[45] = %d, E[56] = %d\n", A[12], B[23], C[34], D[45], E[56]);

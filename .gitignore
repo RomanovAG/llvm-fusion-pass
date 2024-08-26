@@ -5,3 +5,6 @@ build/Makefile
 build/*.so
 
 *.swp
+*.ll
+*.exe
+*.txt

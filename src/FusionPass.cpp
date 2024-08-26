@@ -1,17 +1,20 @@
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/Analysis/AssumptionCache.h"
-#include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/DependenceAnalysis.h"
 #include "llvm/Analysis/PostDominators.h"
 #include "llvm/Analysis/ScalarEvolution.h"
-#include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/IR/Dominators.h"
+#include "llvm/IR/Verifier.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/raw_ostream.h"
 #include <set>
 
 using namespace llvm;
+
+static cl::opt<bool> DebugMode(
+    "debug", cl::desc("Enable debug mode for fusion-pass"),
+    cl::init(false));
 
 namespace {
 
@@ -103,15 +106,110 @@ isControlFlowEqLoops(const Loop *L1, const Loop *L2, const DominatorTree &DT, co
 }
 
 void
+replaceVariableInBlock(BasicBlock &BB, Value *OldValue, Value *NewValue)
+{
+	for (Instruction &I : BB)
+	{
+		if (PHINode *Phi = dyn_cast<PHINode>(&I))
+		{
+			for (unsigned i = 0, e = Phi->getNumIncomingValues(); i != e; i++)
+			{
+				if (Phi->getIncomingValue(i) == OldValue)
+				{
+					Phi->setIncomingValue(i, NewValue);
+					//errs() << "phi num ops: " << Phi->getNumOperands() << "\n";
+				}
+			}
+		}
+		else if (CallBase *CB = dyn_cast<CallBase>(&I))
+		{
+			for (Use &U : CB->data_ops())
+			{
+				if (U.get() == OldValue) 
+				{
+					U.set(NewValue);
+					//errs() << "cb: " << CB->getNumOperands() << "\n";
+				}
+			}
+		}
+		else
+		{
+			for (Use &U : I.operands())
+			{
+				if (U.get() == OldValue) 
+				{
+					U.set(NewValue);
+				}
+			}
+		}
+		
+	}
+}
+
+void
+replaceVariableInLoop(Loop &L, Value *OldValue, Value *NewValue)
+{
+	for (BasicBlock *BB : L.blocks())
+	{
+		replaceVariableInBlock(*BB, OldValue, NewValue);
+	}
+}
+
+void
+replaceVariableInFunction(Function &F, Value *OldValue, Value *NewValue)
+{
+	for (BasicBlock &BB : F)
+	{
+		replaceVariableInBlock(BB, OldValue, NewValue);
+	}
+}
+
+bool
+isIndex(const BasicBlock &BB, const Value &V)
+{
+	for (auto it1 = BB.begin(), it2 = std::next(it1); it2 != BB.end(); ++it1, ++it2)
+	{
+		if (&*it2 == BB.getTerminator())
+		{
+			if (it1->getOpcode() == Instruction::ICmp && it1->getOperand(0) == &V)
+			{
+				if (it2->getOperand(0) == &*it1)
+				{
+					return true;
+				}
+			}
+		}
+	}
+	return false;
+}
+
+Value *
+getIndex(const BasicBlock &Header)
+{
+	for (auto it1 = Header.begin(), it2 = std::next(it1); it2 != Header.end(); ++it1, ++it2)
+	{
+		if (&*it2 == Header.getTerminator())
+		{
+			if (it1->getOpcode() == Instruction::ICmp &&  it2->getOperand(0) == &*it1)
+			{
+				return it1->getOperand(0);
+			}
+		}
+	}
+	return nullptr;
+}
+
+void
 fuse(Loop *L1, Loop *L2)
 {
 	BasicBlock *Header1 = L1->getHeader(); /* Will be Header */
 	BasicBlock *Header2 = L2->getHeader(); /* Will be deleted */
 	BasicBlock *Latch1 = L1->getLoopLatch(); /* Will be Latch */
-	BasicBlock *Latch2 = L2->getLoopLatch();
+	BasicBlock *Latch2 = L2->getLoopLatch(); /* Will be deleted */  
 	BasicBlock *PreHeader1 = L1->getLoopPreheader();
 	BasicBlock *PreHeader2 = L2->getLoopPreheader(); /* Will be deleted */	
-//assert(Latch1->size() == Latch2->size() == 2);
+
+	assert(Latch1->size() == Latch2->size());
 
 	BasicBlock *BodyEntry2 = Header2->getTerminator()->getSuccessor(0);
 	BasicBlock *Exit2 = Header2->getTerminator()->getSuccessor(1);
@@ -130,23 +228,43 @@ fuse(Loop *L1, Loop *L2)
 	Instruction *Header1Term = Header1->getTerminator();
 	Header1Term->replaceSuccessorWith(PreHeader2, Exit2);
 
-	/* Update phis' predecessors */
-	for (PHINode &Phi1 : Header1->phis())
+	/* Update phis' values */
+	Function *F = Header1->getParent();
+	SmallVector<PHINode *> PhiToDelete;
+	for (PHINode &Phi2 : Header2->phis())
 	{
-		int idx1 = Phi1.getBasicBlockIndex(Latch1);
-		if (idx1 > -1)
+		Value *OldValue = &Phi2;
+		if (isIndex(*Header2, Phi2))
 		{
-			Value *V = Phi1.getIncomingValue(idx1);
-			for (PHINode &Phi2 : Header2->phis())
+			Value *NewValue = getIndex(*Header1);
+
+			replaceVariableInFunction(*F, OldValue, NewValue);
+			PhiToDelete.push_back(&Phi2);
+		}
+		else
+		{
+			for (PHINode &Phi1 : Header1->phis())
 			{
-				int idx2 = Phi2.getBasicBlockIndex(Latch2);
-				if (idx2 > -1)
+				if (&Phi1 == Phi2.getIncomingValue(0))
 				{
-					Phi2.setIncomingValue(idx2, V);
+					Value *NewValue = Phi1.getIncomingValueForBlock(Latch1);
+					Phi1.setIncomingValueForBlock(Latch1, Phi2.getIncomingValueForBlock(Latch2));
+
+					/* Update local scope first */
+					replaceVariableInLoop(*L2, OldValue, NewValue);
+
+					/* Update global scope */
+					replaceVariableInFunction(*F, OldValue, &Phi1);
+					PhiToDelete.push_back(&Phi2);
 				}
 			}
 		}
 	}
+	for (PHINode *Phi : PhiToDelete)
+	{
+		Phi->eraseFromParent();
+	}
+
 	Header2->replacePhiUsesWith(PreHeader2, PreHeader1);
 	Header2->replacePhiUsesWith(Latch2, Latch1);
 
@@ -159,28 +277,13 @@ fuse(Loop *L1, Loop *L2)
 		Phi->insertBefore(FirstNonPhi1);
 	}
 
-	/* Handle case when one phi-node uses value produced by another in the same BB */
-	for (auto it1 = Header1->phis().begin(), it1e = Header1->phis().end(); it1 != it1e; ++it1)
-	{
-		Value *V = &*it1;
-		const PHINode &Phi1 = *it1;
-		for (auto it2 = std::next(it1), it2e = it1e; it2 != it2e; ++it2)
-		{
-			PHINode &Phi2 = *it2;
-			if (Phi2.getIncomingValueForBlock(PreHeader1) == V)
-			{
-				Value *VNew = Phi1.getIncomingValueForBlock(PreHeader1);
-				Phi2.setIncomingValueForBlock(PreHeader1, VNew);
-			}
-		}
-	}
 	assert(Header2->size() == 2 && "Incorrect Header2 size");
 	
 	while (pred_begin(Latch2) != pred_end(Latch2))
 	{
 		(*(pred_begin(Latch2)))->getTerminator()->replaceSuccessorWith(Latch2, Latch1);
 	}
-	//outs() << "\tsiz: " << Latch1->size() << "\n";
+	//errs() << "\tsiz: " << Latch1->size() << "\n";
 
 	
 	/* Cleanup */
@@ -317,14 +420,14 @@ blockUsesValue(const BasicBlock *BB, const Value *V)
 	return false;
 }
 
-bool
+/* Deprecated */
+/*bool
 blocksHaveNegativeDependencies(const BasicBlock &First, const BasicBlock &Second)
 {
 	for (const Instruction &I1 : First)
 	{
 		if (I1.getOpcode() == Instruction::Store)
 		{
-			//outs() << "store\n";
 			for (Value *V : I1.operands())
 			{
 				if (blockUsesValue(&Second, V))
@@ -339,7 +442,7 @@ blocksHaveNegativeDependencies(const BasicBlock &First, const BasicBlock &Second
 		}
 	}
 	return false;
-}
+}*/
 
 bool
 areSameIndex(const Instruction &I1, const Instruction &I2)
@@ -347,9 +450,11 @@ areSameIndex(const Instruction &I1, const Instruction &I2)
 	bool first = false;
 	bool second = false;
 	const Instruction *IPtr1 = dyn_cast<Instruction>(I1.getOperand(1));
-	if (IPtr1->getOpcode() == Instruction::SExt)
+	if (!IPtr1) return false;
+	if (IPtr1->getOpcode() == Instruction::SExt || IPtr1->getOpcode() == Instruction::ZExt)
 	{
 		IPtr1 = dyn_cast<Instruction>(IPtr1->getOperand(0));
+		if (!IPtr1) return false;
 	}
 	if (IPtr1->getOpcode() == Instruction::PHI)
 	{
@@ -366,9 +471,11 @@ areSameIndex(const Instruction &I1, const Instruction &I2)
 		}
 	}
 	const Instruction *IPtr2 = dyn_cast<Instruction>(I2.getOperand(1));
-	if (IPtr2->getOpcode() == Instruction::SExt)
+	if (!IPtr2) return false;
+	if (IPtr2->getOpcode() == Instruction::SExt || IPtr2->getOpcode() == Instruction::ZExt)
 	{
 		IPtr2 = dyn_cast<Instruction>(IPtr2->getOperand(0));
+		if (!IPtr2) return false;
 	}
 	if (IPtr2->getOpcode() == Instruction::PHI)
 	{
@@ -388,6 +495,25 @@ areSameIndex(const Instruction &I1, const Instruction &I2)
 }
 
 bool
+blocksHaveFlowDependencies(BasicBlock &BB1, BasicBlock &BB2, DependenceInfo &DI)
+{
+	for (Instruction &I1 : BB1)
+	{
+		for (Instruction &I2 : BB2)
+		{
+			if (const auto Dep = DI.depends(&I1, &I2, true))
+			{
+				if (Dep->isFlow())
+				{
+					return true;
+				}
+			}
+		}
+	}
+	return false;
+}
+
+bool
 loopsHaveInvalidDependencies(const Loop *L1, const Loop *L2, DependenceInfo &DI)
 {
 	for (BasicBlock *BB1 : L1->blocks())
@@ -402,20 +528,22 @@ loopsHaveInvalidDependencies(const Loop *L1, const Loop *L2, DependenceInfo &DI)
 					{
 						if (Dep->isFlow())
 						{
-							//outs() << "Entereddep\n";
-							//outs() << Dep->getSrc()->getNumOperands() << "\n";
+							//errs() << "Entereddep\n";
+							//errs() << Dep->getSrc()->getNumOperands() << "\n";
 							Instruction *Src, *Dst;
 							if ((Src = dyn_cast<Instruction>(Dep->getSrc()->getOperand(1))) && (Dst = dyn_cast<Instruction>(Dep->getDst()->getOperand(0))))
 							{
 								if (Src->getOpcode() == Instruction::GetElementPtr && Dst->getOpcode() == Instruction::GetElementPtr)
 								{
+									//errs() << "test same index: ";
 									if (areSameIndex(*Src, *Dst))
 									{
-										outs() << "\ta[i]\n";
+										//errs() << "a[i]\n";
 										continue;
 									}
 								}
 							}
+							//errs() << "inv dep\n";
 							return true;
 						}
 					}
@@ -446,9 +574,16 @@ areLoopsAdjacent(const Loop *L1, const Loop *L2)
 bool
 tryMoveInterferingCode(Loop *L1, Loop *L2, DependenceInfo &DI)
 {
+	return false;
 	DenseMap<BasicBlock *, int> WaysToMove; /* 10 - up; 01 - down; 11 both; 00 - can't move */
-	BasicBlock *Exit = L1->getExitBlock();
-	BasicBlock *BB = Exit->getSingleSuccessor();
+	BasicBlock *Exit1 = L1->getExitBlock();
+	BasicBlock *PreHeader2 = L2->getLoopPreheader();
+	BasicBlock *BB = Exit1->getSingleSuccessor();
+
+	assert(Exit1 != PreHeader2 
+		&& Exit1->getSingleSuccessor() != PreHeader2 
+		&& "No complex interfering code here");
+
 	while (BB != L2->getLoopPreheader())
 	{
 		WaysToMove.insert(std::make_pair(BB, 0b11));
@@ -501,13 +636,30 @@ tryMoveInterferingCode(Loop *L1, Loop *L2, DependenceInfo &DI)
 }
 
 bool
-tryCleanPreHeader(Loop *L1, Loop *L2)
+tryCleanPreHeader(Loop *L1, Loop *L2, DependenceInfo &DI)
 {
 	DenseMap<Instruction *, int> WaysToMove; /* 10 - up; 01 - down; 11 both; 00 - can't move */
 
 	BasicBlock *Exit1 = L1->getExitBlock();
 	BasicBlock *PreHeader2 = L2->getLoopPreheader();
 	if (Exit1 != PreHeader2) assert(Exit1->size() == 1 && Exit1->getSingleSuccessor() == PreHeader2);
+
+	int m = 0b11;
+	for (BasicBlock *BB1 : L1->blocks())
+	{
+		if (blocksHaveFlowDependencies(*BB1, *PreHeader2, DI))
+		{
+			m &= 0b01;
+		}
+	}
+	for (BasicBlock *BB2 : L2->blocks())
+	{
+		if (blocksHaveFlowDependencies(*PreHeader2, *BB2, DI))
+		{
+			m &= 0b10;
+		}
+	}
+	if (m == 0) {/*errs() << "flow\n"*/; return false;}
 
 	for (Instruction &I : *PreHeader2)
 	{
@@ -523,6 +675,7 @@ tryCleanPreHeader(Loop *L1, Loop *L2)
 				if (blockProducesValue(L1BB, V))
 				{
 					WaysToMove[&I] &= 0b01;
+					//move &= 0b01;
 				}
 			}
 		}
@@ -532,9 +685,11 @@ tryCleanPreHeader(Loop *L1, Loop *L2)
 			if (blockUsesValue(L2BB, &I))
 			{
 				WaysToMove[&I] &= 0b10;
+				//move &= 0b01;
 			}
 		}
 		if (WaysToMove.at(&I) == 0b00)
+		//if (move == 0b00)
 		{
 			return false;
 		}
@@ -593,9 +748,9 @@ tryCleanExit(Loop *L1, Loop *L2)
 }
 
 bool
-tryCleanExitAndPreHeader(Loop *L1, Loop *L2)
+tryCleanExitAndPreHeader(Loop *L1, Loop *L2, DependenceInfo &DI)
 {
-	return tryCleanExit(L1, L2) && tryCleanPreHeader(L1, L2);
+	return tryCleanExit(L1, L2) && tryCleanPreHeader(L1, L2, DI);
 }
 
 bool
@@ -618,9 +773,9 @@ tryMakeLoopsAdjacent(Loop *L1, Loop *L2, DependenceInfo &DI)
 
 	if (Exit1->size() > 1 || PreHeader2->size() > 1)
 	{
-		if (tryCleanExitAndPreHeader(L1, L2) == false)
+		if (tryCleanExitAndPreHeader(L1, L2, DI) == false)
 		{
-			outs() << "can not clean pre header\n";
+			//errs() << "can not clean pre header\n";
 			return false;
 		}
 	}
@@ -638,7 +793,7 @@ tryMakeLoopsAdjacent(Loop *L1, Loop *L2, DependenceInfo &DI)
 		return true;
 	}
 
-	//outs() << "can not make adj\n";
+	//errs() << "can not make adj\n";
 	return false;
 }
 
@@ -727,10 +882,14 @@ bool
 FuseLoops(Function &F, FunctionAnalysisManager &FAM)
 {
 	bool changed = false;
-	outs() << "Func: " << F.getName() << "\n";
 
-	unsigned LoopCount = FAM.getResult<LoopAnalysis>(F).getLoopsInPreorder().size();
-	outs() << "\tloop count before: " << LoopCount << "\n";
+	unsigned LoopCount;
+	if (DebugMode)
+	{
+		LoopCount = FAM.getResult<LoopAnalysis>(F).getLoopsInPreorder().size();
+		errs() << "Func: " << F.getName() << "\n";
+		errs() << "\tloop count before: " << LoopCount << "\n";
+	}
 	SmallVector<Loop *> LoopsToProcess;
 	unsigned i = 1;
 	while (true)
@@ -761,9 +920,12 @@ FuseLoops(Function &F, FunctionAnalysisManager &FAM)
 			i++;
 		}
 	}
-	if (changed)
-		LoopCount = FAM.getResult<LoopAnalysis>(F).getLoopsInPreorder().size();
-	outs()	<< "\tloop count after : " << LoopCount << "\n";
+	if (DebugMode)
+	{
+		if (changed)
+			LoopCount = FAM.getResult<LoopAnalysis>(F).getLoopsInPreorder().size();
+		errs()	<< "\tloop count after : " << LoopCount << "\n";
+	}
 	return changed;
 }
 

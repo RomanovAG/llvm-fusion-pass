@@ -10,7 +10,7 @@ $ cmake -DLT_LLVM_INSTALL_DIR=$LLVM_DIR
 $ make
 ```
 **2.1**\
-If you want to skip all preparations and test lib instead, run *test.sh* and check *.ll* files and output produced by compiled programs.\
+If you want to skip all preparations and test lib instead, run *test.sh* and check *.ll* files and output produced by compiled programs.
 ```
 $ cd llvm-fusion-pass
 $ bash test.sh

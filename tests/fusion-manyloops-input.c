@@ -11,8 +11,9 @@ void print_2d_arr(int A[][100], int N)
 	{
 		for (int j = 0; j < N; j++)
 		{
-			printf("%d", A[i][j]);
+			printf("%d;", A[i][j]);
 		}
+		printf("\n");
 	}
 	printf("\n");
 }

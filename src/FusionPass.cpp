@@ -12,11 +12,11 @@
 
 using namespace llvm;
 
-static cl::opt<bool> DebugMode(
+namespace {
+
+cl::opt<bool> DebugMode(
     "debug", cl::desc("Enable debug mode for fusion-pass"),
     cl::init(false));
-
-namespace {
 
 bool
 loopHasMultipleEntriesAndExits(const Loop &L)
@@ -121,7 +121,7 @@ replaceVariableInBlock(BasicBlock &BB, Value *OldValue, Value *NewValue)
 				}
 			}
 		}
-		else if (CallBase *CB = dyn_cast<CallBase>(&I))
+		/*else if (CallBase *CB = dyn_cast<CallBase>(&I))
 		{
 			for (Use &U : CB->data_ops())
 			{
@@ -131,7 +131,7 @@ replaceVariableInBlock(BasicBlock &BB, Value *OldValue, Value *NewValue)
 					//errs() << "cb: " << CB->getNumOperands() << "\n";
 				}
 			}
-		}
+		}*/
 		else
 		{
 			for (Use &U : I.operands())
@@ -284,7 +284,6 @@ fuse(Loop *L1, Loop *L2)
 		(*(pred_begin(Latch2)))->getTerminator()->replaceSuccessorWith(Latch2, Latch1);
 	}
 	//errs() << "\tsiz: " << Latch1->size() << "\n";
-
 	
 	/* Cleanup */
 	PreHeader2->eraseFromParent();
@@ -445,52 +444,67 @@ blocksHaveNegativeDependencies(const BasicBlock &First, const BasicBlock &Second
 }*/
 
 bool
+refersToIndex(const Instruction &I)
+{
+	assert(I.getOpcode() == Instruction::GetElementPtr);
+	bool AllIndex = true;
+
+	for (Value *V : I.operands())
+	{
+		if (isa<Constant>(V))
+		{
+			//errs() << I.getNumOperands() <<" const\n";
+			continue;
+		}
+		Instruction *II = dyn_cast<Instruction>(V);
+		if (!II)
+		{
+			if (isa<Argument>(V))
+			{
+				continue;
+			}
+			return false;
+		}
+		else if (II->getOpcode() == Instruction::SExt || II->getOpcode() == Instruction::ZExt)
+		{
+			II = dyn_cast<Instruction>(II->getOperand(0));
+			if (II && II->getOpcode() == Instruction::PHI)
+			{
+				AllIndex &= isIndex(*(II->getParent()), *II);
+			}
+			else
+			{
+				//errs() << "f1\n";
+				return false;
+			}
+		}
+		else if (II->getOpcode() == Instruction::GetElementPtr)
+		{
+			AllIndex &= refersToIndex(*II);
+		}
+		else if (II->getOpcode() == Instruction::PHI)
+		{
+			AllIndex &= isIndex(*(II->getParent()), *II);
+		}
+		else
+		{	
+			//errs() << II->getOpcodeName() <<" f2\n";
+			return false;
+		}
+	}
+	return AllIndex;
+}
+
+bool
 areSameIndex(const Instruction &I1, const Instruction &I2)
 {
+	assert(I1.getOpcode() == Instruction::GetElementPtr && I2.getOpcode() == Instruction::GetElementPtr);
 	bool first = false;
 	bool second = false;
-	const Instruction *IPtr1 = dyn_cast<Instruction>(I1.getOperand(1));
-	if (!IPtr1) return false;
-	if (IPtr1->getOpcode() == Instruction::SExt || IPtr1->getOpcode() == Instruction::ZExt)
-	{
-		IPtr1 = dyn_cast<Instruction>(IPtr1->getOperand(0));
-		if (!IPtr1) return false;
-	}
-	if (IPtr1->getOpcode() == Instruction::PHI)
-	{
-		const BasicBlock *Parent1 = IPtr1->getParent();
-		for (auto it = Parent1->getFirstNonPHIIt(), ite = Parent1->end(); it != ite; ++it)
-		{
-			if (it->getOpcode() == Instruction::ICmp && it->getOperand(0) == IPtr1)
-			{
-				if (Parent1->getTerminator()->getOperand(0) == &*it)
-				{
-					first = true;
-				}
-			}
-		}
-	}
-	const Instruction *IPtr2 = dyn_cast<Instruction>(I2.getOperand(1));
-	if (!IPtr2) return false;
-	if (IPtr2->getOpcode() == Instruction::SExt || IPtr2->getOpcode() == Instruction::ZExt)
-	{
-		IPtr2 = dyn_cast<Instruction>(IPtr2->getOperand(0));
-		if (!IPtr2) return false;
-	}
-	if (IPtr2->getOpcode() == Instruction::PHI)
-	{
-		const BasicBlock *Parent2 = IPtr2->getParent();
-		for (auto it = Parent2->getFirstNonPHIIt(), ite = Parent2->end(); it != ite; ++it)
-		{
-			if (it->getOpcode() == Instruction::ICmp && it->getOperand(0) == IPtr2)
-			{
-				if (Parent2->getTerminator()->getOperand(0) == &*it)
-				{
-					second = true;
-				}
-			}
-		}
-	}
+
+	first  = refersToIndex(I1);
+	second = refersToIndex(I2);
+
 	return first & second;
 }
 
@@ -529,7 +543,8 @@ loopsHaveInvalidDependencies(const Loop *L1, const Loop *L2, DependenceInfo &DI)
 						if (Dep->isFlow())
 						{
 							//errs() << "Entereddep\n";
-							//errs() << Dep->getSrc()->getNumOperands() << "\n";
+							//errs() << Dep->getSrc()->getOpcodeName() << " ";
+							//errs() << Dep->getDst()->getOpcodeName() << "\n";
 							Instruction *Src, *Dst;
 							if ((Src = dyn_cast<Instruction>(Dep->getSrc()->getOperand(1))) && (Dst = dyn_cast<Instruction>(Dep->getDst()->getOperand(0))))
 							{
@@ -574,7 +589,6 @@ areLoopsAdjacent(const Loop *L1, const Loop *L2)
 bool
 tryMoveInterferingCode(Loop *L1, Loop *L2, DependenceInfo &DI)
 {
-	return false;
 	DenseMap<BasicBlock *, int> WaysToMove; /* 10 - up; 01 - down; 11 both; 00 - can't move */
 	BasicBlock *Exit1 = L1->getExitBlock();
 	BasicBlock *PreHeader2 = L2->getLoopPreheader();
@@ -583,6 +597,7 @@ tryMoveInterferingCode(Loop *L1, Loop *L2, DependenceInfo &DI)
 	assert(Exit1 != PreHeader2 
 		&& Exit1->getSingleSuccessor() != PreHeader2 
 		&& "No complex interfering code here");
+	return false;
 
 	while (BB != L2->getLoopPreheader())
 	{
@@ -659,7 +674,7 @@ tryCleanPreHeader(Loop *L1, Loop *L2, DependenceInfo &DI)
 			m &= 0b10;
 		}
 	}
-	if (m == 0) {/*errs() << "flow\n"*/; return false;}
+	if (m == 0) {errs() << "flow\n"; return false;}
 
 	for (Instruction &I : *PreHeader2)
 	{

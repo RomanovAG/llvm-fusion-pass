@@ -5,8 +5,8 @@ OPT="./../build/bin/opt"
 INPUT_FILE="./tests/fusion-manyloops-input.c"
 PLUGIN_PATH="./build/libfusion-pass.so"
 
-EXE_INPUT="fusion-manyloops-input.exe"
-EXE_OUTPUT="fusion-manyloops-output.exe"
+EXE_INPUT="fusion-manyloops-input.bin"
+EXE_OUTPUT="fusion-manyloops-output.bin"
 LL_INPUT="fusion-manyloops-input.ll"
 LL_OUTPUT="fusion-manyloops-output.ll"
 
@@ -26,7 +26,7 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
-$OPT -S -passes="mem2reg" $LL_INPUT -o $LL_INPUT
+$OPT -S -passes=mem2reg $LL_INPUT -o $LL_INPUT
 if [ $? -ne 0 ]; then
     echo "mem2reg pass failed."
     exit 1
@@ -40,7 +40,7 @@ fi
 
 $CLANG -O0 -Xclang -disable-O0-optnone $LL_OUTPUT -o $EXE_OUTPUT
 if [ $? -ne 0 ]; then
-    echo "LLVM IR generation failed."
+    echo "Second program compilation failed."
     exit 1
 fi
 

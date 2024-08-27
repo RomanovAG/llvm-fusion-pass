@@ -5,6 +5,18 @@ int max(int a, int b)
 	return a >= b ? a : b;
 }
 
+void print_2d_arr(int A[][100], int N)
+{
+	for (int i = 0; i < N; i++)
+	{
+		for (int j = 0; j < N; j++)
+		{
+			printf("%d", A[i][j]);
+		}
+	}
+	printf("\n");
+}
+
 void to_be_fused(int N, int M)
 {
 	int arr[66] = {0};
@@ -98,7 +110,7 @@ void nested_no_dep_should(int F[][100], int G[][100], int SIZE)
 	{
 		for (int j = 0; j < SIZE; j++)
 		{
-			G[i][j]++;
+			G[j][i]++;
 		}
 	}
 }
@@ -125,6 +137,18 @@ void diff_directions_var2_shouldnot(int *a, int *b, int N)
 	for (int i = 0; i < N; i++)
 	{
 		b[N - i - 1] = a[N - i - 1];
+	}
+}
+
+void ambiguous_dependence_shouldnot(int *A, int *B, int SIZE)
+{
+	for (int i = 1; i < SIZE; i++)
+	{
+		A[i] = A[i - 1] + 1;
+	}
+	for (int i = 0; i < SIZE; i++)
+	{
+		B[i] = A[i] * 2;
 	}
 }
 
@@ -197,68 +221,88 @@ void extreme_test(int SIZE)
 		}
 	}
 	to_be_fused(50, 66);
-	diff_directions_shouldnot(A, B, SIZE);
-	diff_directions_var2_shouldnot(A, B, SIZE);
-    // Case 3: Dependent loops that cannot be fused
-    for (i = 1; i < SIZE; i++) {
-        A[i] = A[i - 1] + 1;
-    }
-    for (i = 0; i < SIZE; i++) {
-        B[i] = A[i] * 2;
-    }
+	
+	for (i = 1; i < SIZE; i++)
+	{
+		A[i] = A[i - 1] + 1;
+	}
+	for (i = 0; i < SIZE; i++)
+	{
+		B[i] = A[i] * 2;
+	}
 	nested_no_dep_should(F, G, SIZE);
+	print_2d_arr(F, SIZE);
+	print_2d_arr(G, SIZE);
 
-    // Case 4: Loops with different strides
-    for (i = 0; i < SIZE; i += 2) {
-        C[i]++;
-    }
-    for (i = 1; i < SIZE; i += 2) {
-        D[i]--;
-    }
+	// Loops with different strides
+	for (i = 0; i < SIZE; i += 2)
+	{
+		C[i]++;
+	}
+	for (i = 1; i < SIZE; i += 2)
+	{
+		D[i]--;
+	}
 
-    // Case 5: Loops with complex control flow
-    for (i = 0; i < SIZE; i++) {
-        for (j = 0; j < SIZE; j++) {
-            if (i % 2 == 0) {
-                H[i][j] = H[i][j] + i + j;
-            } else {
-                H[i][j] = H[i][j] - i - j;
-            }
-        }
-    }
-    for (i = 0; i < SIZE; i++) {
-        for (j = 0; j < SIZE; j++) {
-            if (H[i][j] > 0) {
-                I[i][j] = H[i][j] * 2;
-            } else {
-                I[i][j] = H[i][j] / 2;
-            }
-        }
-    }
+	diff_directions_shouldnot(A, B, SIZE);
 
-    // Case 6: Nested loops with dependencies on different levels
-    for (i = 0; i < SIZE; i++) {
-        for (j = 0; j < SIZE; j++) {
-            E[i] = i + j;
-        }
-        for (j = 0; j < SIZE; j++) {
-            E[i] += E[j];
-        }
-    }
+	// Loops with complex control flow
+	for (i = 0; i < SIZE; i++)
+	{
+		for (j = 0; j < SIZE; j++)
+		{
+			if (i % 2 == 0)
+			{
+				H[i][j] = H[i][j] + i + j;
+			} 
+			else
+			{
+				H[i][j] = H[j][i] - i - j;
+			}
+		}
+	}
+	for (i = 0; i < SIZE; i++)
+	{
+		for (j = 0; j < SIZE; j++)
+		{
+			if (H[i][j] > 0)
+			{
+				I[i][j] = H[j][i] * 2;
+			}
+			else
+			{
+				I[i][j] = H[i][j] / 2;
+			}
+		}
+	}
+
+	// Nested loops with dependencies on different levels
+	for (i = 0; i < SIZE; i++)
+	{
+		for (j = 0; j < SIZE; j++)
+		{
+			E[i] = i + j;
+		}
+		for (j = 0; j < SIZE; j++)
+		{
+			E[i] += E[j] + (i - j);
+		}
+	}
+	
+	diff_directions_var2_shouldnot(A, B, SIZE);
 
 	for (int i = 0; i < SIZE; i++)
 	{
 		for (int j = 0; j < SIZE; j++)
 		{
 			F[i][j] = i * j;
-			//printf("case 2 loop 1.1");
 		}
 	}
 	for (int i = 0; i < SIZE; i++)
 	{
 		for (int j = 0; j < SIZE; j++)
 		{
-			G[i][j]++;
+			G[i][j] += 1 + (i / max(j, 1));
 		}
 	}
 

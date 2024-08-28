@@ -11,8 +11,15 @@ namespace {
 
 /* -debug flag handler */
 cl::opt<bool> DebugMode(
-    "debug", cl::desc("Enable debug mode for fusion-pass"),
-    cl::init(false));
+	"debug",
+	cl::desc("Enable debug mode for fusion-pass"),
+	cl::init(false));
+
+/* True by default */
+cl::opt<bool> AllowThrow(
+	"allow-throw",
+	cl::desc("Allow fusion for loops containing throw instructions"),
+	cl::init(true));
 
 bool
 loopHasMultipleEntriesAndExits(const Loop &L)
@@ -826,9 +833,9 @@ processLoops(const SmallVector<Loop *> &Loops, const DominatorTree &DT, const Po
 	{
 		if	(
 			L->isLoopSimplifyForm()
-			&& loopContainsVolatileInst(*L) == false
-			//&& loopMightThrowException(*L) == false /* Somehow always returns true */
-			&& loopHasMultipleEntriesAndExits(*L) == false
+			&& (loopContainsVolatileInst(*L) == false)
+			&& (loopMightThrowException(*L) == false  || AllowThrow) /* Somehow always true */
+			&& (loopHasMultipleEntriesAndExits(*L) == false)
 			)
 		{
 			Candidates.insert(L);

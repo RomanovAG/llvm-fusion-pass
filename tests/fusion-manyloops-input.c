@@ -85,6 +85,24 @@ void doit2(int *a, size_t n)
 	}
 }
 
+void volatile_shouldnot(int *A, int *B, int SIZE)
+{
+	volatile int x = 0;
+	for (int i = 0; i < SIZE; i++)
+	{
+		A[i] = x;
+	}
+	for (int i = 0; i < SIZE; i++)
+	{
+		B[i] = A[i] + 1;
+	}
+	for (int i = 0; i < SIZE; i++)
+	{
+		B[i]++;
+		x++;
+	}
+}
+
 void simple_1_should(int *A, int *B, int SIZE)
 {
 	for (int i = 0; i < SIZE; i++)
